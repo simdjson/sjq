@@ -17,16 +17,25 @@ struct token {
   // A string with interpolations: literal parts at even indexes, the source
   // of the expressions at odd indexes.
   std::vector<std::string> parts{};
+  std::vector<size_t> part_pos{};  // offset of each part in the filter
   int line{1};
+  size_t pos{0};  // offset of the token in the filter
 };
 
 struct lexer {
   std::string src{};
   size_t i{0};
   std::vector<token> toks{};
-  int base_line{1};  // line of src[0] in the whole filter
+  int base_line{1};   // line of src[0] in the whole filter
+  size_t base_pos{0};  // offset of src[0] in the whole filter
+  size_t tok_start{0}; // start of the token being read
 
-  [[noreturn]] void fail(const std::string &m) { throw std::runtime_error("syntax error: " + m); }
+  [[noreturn]] void fail(const std::string &m, std::string hint = std::string()) {
+    throw syntax_error("syntax error: " + m, base_pos + tok_start, std::move(hint));
+  }
+  [[noreturn]] void fail_at(const std::string &m, size_t at, std::string hint = std::string()) {
+    throw syntax_error("syntax error: " + m, base_pos + at, std::move(hint));
+  }
 
   static bool ident_start(char c) { return isalpha((unsigned char)c) || c == '_'; }
   static bool ident_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
@@ -47,6 +56,13 @@ struct lexer {
       cp = cp * 16 + unsigned(d);
     }
     return cp;
+  }
+
+  // The whole UTF-8 character that starts at src[at].
+  std::string utf8_char_at(size_t at) const {
+    unsigned char c = (unsigned char)src[at];
+    size_t len = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2));
+    return src.substr(at, std::min(len, src.size() - at));
   }
 
   int line_at(size_t pos) const {
@@ -89,8 +105,11 @@ struct lexer {
 
   // Reads a string literal; i points after the opening quote. Returns the
   // parts (one literal part when there is no interpolation).
+  std::vector<size_t> last_part_pos{};  // set by read_string
+
   std::vector<std::string> read_string() {
     std::vector<std::string> parts(1);
+    last_part_pos.assign(1, 0);
     while (i < src.size() && src[i] != '"') {
       std::string &r = parts.back();
       char c = src[i++];
@@ -129,7 +148,9 @@ struct lexer {
       case '(': {
         size_t close = skip_interp(i);
         parts.push_back(src.substr(i, close - i));
+        last_part_pos.push_back(base_pos + i);
         parts.emplace_back();
+        last_part_pos.push_back(0);
         i = close + 1;
         break;
       }
@@ -144,6 +165,7 @@ struct lexer {
   void push(T t, std::string s, size_t at) {
     token tk{t, std::move(s)};
     tk.line = line_at(at);
+    tk.pos = base_pos + at;
     toks.push_back(std::move(tk));
   }
 
@@ -155,13 +177,27 @@ struct lexer {
       if (i < src.size() && src[i] == '#') { while (i < src.size() && src[i] != '\n') { i++; } continue; }
       if (i >= src.size()) { push(T::End, "", i); return; }
       size_t start = i;
+      tok_start = start;
       char c = src[i];
       if (c == '.') {
         if (i + 1 < src.size() && src[i + 1] == '.') { i += 2; push(T::DotDot, "..", start); continue; }
-        if (i + 1 < src.size() && ident_start(src[i + 1])) {
+        if (i + 1 < src.size() && (ident_start(src[i + 1]) || (unsigned char)src[i + 1] >= 0x80)) {
           size_t j = i + 1;
-          while (j < src.size() && ident_char(src[j])) { j++; }
-          push(T::Field, src.substr(i + 1, j - i - 1), start);
+          bool ascii = true;
+          while (j < src.size() && (ident_char(src[j]) || (unsigned char)src[j] >= 0x80)) {
+            ascii = ascii && (unsigned char)src[j] < 0x80;
+            j++;
+          }
+          std::string name = src.substr(i + 1, j - i - 1);
+          if (!ascii) {
+            // As in jq, .name takes ASCII letters, digits and '_' only. This is
+            // also what Windows PowerShell 5 leaves of ."name".
+            size_t bad = i + 1;
+            while ((unsigned char)src[bad] < 0x80) { bad++; }
+            fail_at("unexpected character '" + utf8_char_at(bad) + "'", bad,
+                    "a field name with non-ASCII characters needs quotes: write .\"" + name + "\" or .[\"" + name + "\"]");
+          }
+          push(T::Field, name, start);
           i = j;
           continue;
         }
@@ -225,6 +261,7 @@ struct lexer {
         } else {
           push(T::Str, "", start);
           toks.back().parts = std::move(parts);
+          toks.back().part_pos = last_part_pos;
         }
         continue;
       }
@@ -251,7 +288,16 @@ struct lexer {
       }
       if (matched) { continue; }
       if (strchr("|,()[]{}:;<>+-*/%?=", c)) { push(T::Punct, std::string(1, c), start); i++; continue; }
-      fail(std::string("unexpected character '") + c + "'");
+      if (c == '\'') {
+        size_t first = src.find_first_not_of(" \t\r\n");
+        size_t last = src.find_last_not_of(" \t\r\n");
+        bool wrapped = base_pos == 0 && first == i && last != first && src[last] == '\'';
+        fail("unexpected character '\''",
+             wrapped ? "the filter seems to be wrapped in single quotes: the Windows Command Prompt (cmd) passes them on; "
+                       "use double quotes there (with \\\" inside), or put the filter in a file and use -f FILE"
+                     : "strings in filters use double quotes");
+      }
+      fail("unexpected character '" + utf8_char_at(i) + "'");
     }
   }
 };
@@ -270,10 +316,14 @@ struct parser_t {
   const prelude_table *prelude{nullptr};
   compile_info info{};
 
-  [[noreturn]] void fail(const std::string &m) {
-    throw std::runtime_error("syntax error: " + m + " near '" + toks[p].s + "'");
+  [[noreturn]] void fail(const std::string &m, std::string hint = std::string()) {
+    throw syntax_error("syntax error: " + m, toks[p].pos, std::move(hint));
   }
-  [[noreturn]] void fail_plain(const std::string &m) { throw std::runtime_error(m); }
+  // An error that is not about the syntax (an undefined name, a bad key), at
+  // the token at.
+  [[noreturn]] void fail_plain(const std::string &m, size_t at, std::string hint = std::string()) {
+    throw syntax_error(m, toks[at].pos, std::move(hint));
+  }
   const token &peek() const { return toks[p]; }
   bool is_punct(const char *s) const { return toks[p].t == T::Punct && toks[p].s == s; }
   bool is_kw(const char *s) const { return toks[p].t == T::Keyword && toks[p].s == s; }
@@ -289,7 +339,76 @@ struct parser_t {
   void check_var(const std::string &name) {
     if (in_scope(name)) { return; }
     for (const auto &g : globals) { if (g == name) { return; } }
-    fail_plain("$" + name + " is not defined");
+    std::vector<std::string> known(globals.begin(), globals.end());
+    for (const auto &k : scope) {
+      if (k.find('/') == std::string::npos) { known.push_back(k); }
+    }
+    known.push_back("ENV");
+    known.push_back("__loc__");
+    std::string best = closest_name(name, known);
+    fail_plain("$" + name + " is not defined", p, best.empty() ? std::string() : "did you mean $" + best + "?");
+  }
+
+  // Edits (insertions, deletions, substitutions, swaps of neighbors) from a
+  // to b.
+  static size_t edit_distance(const std::string &a, const std::string &b) {
+    std::vector<std::vector<size_t>> d(a.size() + 1, std::vector<size_t>(b.size() + 1));
+    for (size_t i = 0; i <= a.size(); i++) { d[i][0] = i; }
+    for (size_t j = 0; j <= b.size(); j++) { d[0][j] = j; }
+    for (size_t i = 1; i <= a.size(); i++) {
+      for (size_t j = 1; j <= b.size(); j++) {
+        d[i][j] = std::min({d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+        if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) { d[i][j] = std::min(d[i][j], d[i - 2][j - 2] + 1); }
+      }
+    }
+    return d[a.size()][b.size()];
+  }
+
+  // The known name closest to name (at most 2 edits, fewer than its length),
+  // or "".
+  static std::string closest_name(const std::string &name, const std::vector<std::string> &known) {
+    std::string best;
+    size_t best_d = 3;
+    for (const auto &k : known) {
+      if (k == name) { continue; }
+      size_t d = edit_distance(name, k);
+      if (d < best_d && d < name.size()) {
+        best_d = d;
+        best = k;
+      }
+    }
+    return best;
+  }
+
+  // The hint for an undefined function: the arities it has, or a close name.
+  std::string function_hint(const std::string &name, size_t arity) const {
+    std::vector<std::string> keys = builtin_names();
+    for (const auto &k : scope) {
+      if (k.find('/') != std::string::npos) { keys.push_back(k); }
+    }
+    std::vector<std::string> arities, names;
+    for (const auto &k : keys) {
+      size_t slash = k.rfind('/');
+      std::string n = k.substr(0, slash);
+      if (n == name) { arities.push_back(k.substr(slash + 1)); }
+      if (n.empty() || n[0] == '_') { continue; }
+      names.push_back(n);
+    }
+    if (!arities.empty()) {
+      std::sort(arities.begin(), arities.end());
+      arities.erase(std::unique(arities.begin(), arities.end()), arities.end());
+      std::string list;
+      for (size_t k = 0; k < arities.size(); k++) {
+        if (k) { list += k + 1 == arities.size() ? " or " : ", "; }
+        list += arities[k];
+      }
+      return name + " takes " + list + " argument" + (arities.size() == 1 && arities[0] == "1" ? "" : "s") +
+             ", not " + std::to_string(arity);
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    std::string best = closest_name(name, names);
+    return best.empty() ? std::string() : "did you mean " + best + "?";
   }
 
   // Each nested term recurses; deep nesting would overflow the stack.
@@ -532,10 +651,10 @@ struct parser_t {
   }
 
   // jq rejects constant object keys that are not strings when it compiles.
-  void check_const_key(const node *key) {
+  void check_const_key(const node *key, size_t key_pos) {
     auto lit = dynamic_cast<const literal_node *>(key);
     if (lit && lit->v.k != K::Str) {
-      fail_plain(std::string("Cannot use ") + kind_name(lit->v.k) + " (" + error_text(lit->v) + ") as object key");
+      throw syntax_error(std::string("Cannot use ") + kind_name(lit->v.k) + " (" + error_text(lit->v) + ") as object key", toks[key_pos].pos);
     }
   }
 
@@ -581,10 +700,11 @@ struct parser_t {
         } else if (k.t == T::Str) {
           f.key = parse_term();
         } else if (is_punct("(")) {
+          size_t key_at = p + 1;
           p++;
           f.key = parse_pipe();
           expect_punct(")");
-          check_const_key(f.key.get());
+          check_const_key(f.key.get(), key_at);
         } else {
           fail("bad object pattern");
         }
@@ -664,6 +784,7 @@ struct parser_t {
       lexer lx{};
       lx.src = tk.parts[k];
       lx.base_line = tk.line;
+      lx.base_pos = tk.part_pos[k];
       lx.run();
       std::vector<token> saved = std::move(toks);
       size_t saved_p = p;
@@ -678,7 +799,7 @@ struct parser_t {
     return n;
   }
 
-  node_ptr make_call(std::string name, std::vector<node_ptr> args) {
+  node_ptr make_call(std::string name, std::vector<node_ptr> args, size_t at) {
     auto n = std::make_unique<call_node>();
     n->name = std::move(name);
     n->args = std::move(args);
@@ -702,7 +823,7 @@ struct parser_t {
     }
     n->fn = find_builtin(n->key);
     n->pfn = find_builtin_paths(n->key);
-    if (!n->fn) { fail_plain(n->key + " is not defined"); }
+    if (!n->fn) { fail_plain(n->key + " is not defined", at, function_hint(n->name, n->args.size())); }
     return n;
   }
 
@@ -746,7 +867,7 @@ struct parser_t {
       }
       if (tk.s == "ENV" && !in_scope("ENV")) {
         p++;
-        return make_call("env", {});
+        return make_call("env", {}, p - 1);
       }
       check_var(tk.s);
       auto n = std::make_unique<var_node>();
@@ -842,6 +963,7 @@ struct parser_t {
     }
     case T::Ident: {
       std::string name = tk.s;
+      size_t name_at = p;
       p++;
       if (name == "break") {
         if (peek().t != T::Var) { fail("expected $label after break"); }
@@ -858,7 +980,7 @@ struct parser_t {
             return n;
           }
         }
-        fail_plain("$*label-" + l + " is not defined");
+        fail_plain("$*label-" + l + " is not defined", p - 1);
       }
       if ((name == "true" || name == "false" || name == "null") && !is_punct("(")) {
         auto lit = std::make_unique<literal_node>();
@@ -872,7 +994,7 @@ struct parser_t {
         while (is_punct(";")) { p++; args.push_back(parse_pipe()); }
         expect_punct(")");
       }
-      return make_call(name, std::move(args));
+      return make_call(name, std::move(args), name_at);
     }
     case T::Punct: {
       if (tk.s == "(") {
@@ -939,10 +1061,11 @@ struct parser_t {
           } else if (k.t == T::Num) {
             fail("object keys must be strings");
           } else if (is_punct("(")) {
+            size_t key_at = p + 1;
             p++;
             key = parse_pipe();
             expect_punct(")");
-            check_const_key(key.get());
+            check_const_key(key.get(), key_at);
           } else {
             fail("bad object key");
           }
@@ -1021,6 +1144,32 @@ static const prelude_table &prelude_functions() {
     }
   });
   return table;
+}
+
+std::string describe_syntax_error(const std::string &src, const syntax_error &err) {
+  size_t pos = std::min(err.pos, src.size());
+  size_t line_start = src.rfind('\n', pos == 0 ? 0 : pos - 1);
+  line_start = (line_start == std::string::npos || (pos == 0 && src[0] != '\n')) ? 0 : line_start + 1;
+  if (pos < line_start) { line_start = 0; }
+  size_t line_end = src.find('\n', pos);
+  if (line_end == std::string::npos) { line_end = src.size(); }
+  size_t line = 1 + size_t(std::count(src.begin(), src.begin() + std::ptrdiff_t(line_start), '\n'));
+  // Columns count characters, not bytes.
+  auto chars = [&](size_t a, size_t b) {
+    size_t n = 0;
+    for (size_t k = a; k < b; k++) { n += ((unsigned char)src[k] & 0xC0) != 0x80; }
+    return n;
+  };
+  size_t column = chars(line_start, pos) + 1;
+  std::string text = src.substr(line_start, line_end - line_start);
+  for (char &c : text) {
+    if (c == '\t' || c == '\r') { c = ' '; }
+  }
+  std::string out = std::string(err.what()) + " at line " + std::to_string(line) + ", column " + std::to_string(column) + ":\n";
+  out += "    " + text + "\n";
+  out += "    " + std::string(column - 1, ' ') + "^\n";
+  if (!err.hint.empty()) { out += "  " + err.hint + "\n"; }
+  return out;
 }
 
 std::vector<std::string> prelude_names() {

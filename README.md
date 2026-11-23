@@ -43,6 +43,25 @@ ctest --test-dir build --output-on-failure
 cmake --install build
 ```
 
+## Windows: quoting
+
+- Command Prompt (cmd): single quotes are not quotes. Use double quotes, with
+  `\"` inside: `sjq "select(.name == \"x\")" file.json`.
+- Windows PowerShell 5 strips the double quotes inside arguments:
+  `'."année"'` reaches sjq as `.année`.
+- In both, put the filter in a file: `sjq -f filter.jq file.json`.
+- PowerShell 5's `>` writes UTF-16: use `sjq -o out.json ...` instead, and
+  sjq writes UTF-8 itself. sjq reads UTF-16 files with a byte order mark.
+
+## Invalid JSON
+
+Filters that only navigate and select (`.a.b`, `select(...)`, `{id, name}`)
+run on simdjson's On-Demand API, which parses only what the filter reads: the
+parts of a document they skip are not fully checked (`sjq .a` prints `1` for
+`{"a": 1, "b": tru}`). Invalid UTF-8, unclosed strings and unbalanced
+brackets are caught everywhere. `--no-od` checks every document in full, as
+jq does.
+
 ## Performance
 
 sjq against jq 1.8.2 on 1 GB of NDJSON and on one 840 MB document (mean wall

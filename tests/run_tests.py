@@ -249,6 +249,52 @@ def targeted(sjq, data, tmp):
     check("empty input", run([sjq, "."], b"") == (0, b"", b""))
     check("blank input", run([sjq, "."], b"  \n ") == (0, b"", b""))
 
+    # Errors in filters: the position, a caret, hints.
+    code, _, err = run([sjq, "select(.prix > )"], b"{}")
+    check("filter error position", code == 3 and b"line 1, column 16" in err and b"    select(.prix > )\n" in err
+          and b"\n                   ^\n" in err, repr(err))
+    code, _, err = run([sjq, ".ann\u00e9e"], b"{}")
+    check("filter error non-ASCII field", code == 3 and "unexpected character '\u00e9'".encode() in err
+          and '."ann\u00e9e"'.encode() in err, repr(err))
+    code, _, err = run([sjq, "'.a'"], b"{}")
+    check("filter error single quotes", code == 3 and b"single quotes" in err and b"-f" in err, repr(err))
+    code, _, err = run([sjq, ".a | lenght"], b"{}")
+    check("filter error typo", code == 3 and b"did you mean length?" in err and b"column 6" in err, repr(err))
+    code, _, err = run([sjq, "split"], b"{}")
+    check("filter error arity", code == 3 and b"split takes 1 or 2 arguments, not 0" in err, repr(err))
+    code, _, err = run([sjq, "1 as $count | $cuont"], b"{}")
+    check("filter error variable typo", code == 3 and b"did you mean $count?" in err, repr(err))
+
+    # Errors in JSON input: plain words, line and column.
+    code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"b":[1,2}\n')
+    check("JSON error position", code == 5 and out == b'{"a":1}\n' and b"invalid JSON at line 2, column 10: expected ',' or ']' but found '}'" in err,
+          repr(err))
+    code, _, err = run([sjq, "."], b'{"a":1,}')
+    check("JSON error trailing comma", code == 5 and b"found '}' after ','" in err and b"TAPE_ERROR" not in err, repr(err))
+    code, _, err = run([sjq, ".", os.path.join(tmp, "nope.json")])
+    check("missing file reason", code == 2 and (b"No such file or directory" in err), repr(err))
+
+    # Windows: a byte order mark in a filter file, UTF-16 input, -o.
+    fpath = os.path.join(tmp, "bom.jq")
+    with open(fpath, "wb") as f:
+        f.write(b"\xef\xbb\xbf.a")
+    code, out, err = run([sjq, "-f", fpath], b'{"a": 7}')
+    check("-f with a byte order mark", code == 0 and out == b"7\n", f"exit {code} {out!r} {err!r}")
+    u16 = os.path.join(tmp, "u16.json")
+    with open(u16, "wb") as f:
+        f.write('{"a": "\u00e9t\u00e9"}\r\n'.encode("utf-16"))  # with a byte order mark
+    code, out, err = run([sjq, "-r", ".a", u16])
+    check("UTF-16 input with a byte order mark", code == 0 and out == "\u00e9t\u00e9\n".encode(), f"exit {code} {out!r} {err!r}")
+    with open(u16, "wb") as f:
+        f.write('{"a": 1}'.encode("utf-16-le"))
+    code, out, err = run([sjq, ".a", u16])
+    check("UTF-16 input without a byte order mark", code == 2 and b"UTF-16" in err and b"-o" in err, f"exit {code} {err!r}")
+    opath = os.path.join(tmp, "out.json")
+    code, out, err = run([sjq, "-o", opath, ".a"], '{"a": "\u00e9"}'.encode())
+    with open(opath, "rb") as f:
+        written = f.read()
+    check("-o FILE", code == 0 and out == b"" and written == '"\u00e9"\n'.encode(), f"exit {code} {written!r} {err!r}")
+
     # --fractured (simdjson's FracturedJson layout).
     rows = b'[{"id":1,"name":"a","n":10},{"id":22,"name":"bbb","n":3}]'
     code, out, err = run([sjq, "--fractured", "--width", "40", "."], rows)
@@ -351,7 +397,7 @@ def targeted(sjq, data, tmp):
     code, out, _ = run([sjq, "-c", ".i", bad_path])
     check("error mid-stream", code == 5 and out.count(b"\n") == 60000, f"exit {code}, {out.count(chr(10).encode())} lines")
     code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"a": [1,')
-    check("truncated input", code == 5 and out == b'{"a":1}\n' and b"Unfinished" in err, f"exit {code} {out!r} {err!r}")
+    check("truncated input", code == 5 and out == b'{"a":1}\n' and b"unclosed array" in err, f"exit {code} {out!r} {err!r}")
 
     # A file that shrinks while it is read (POSIX test hook).
     if sys.platform != "win32":

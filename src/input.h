@@ -30,11 +30,16 @@ public:
   size_t size() const;
   // True when the mapped file shrank while it was read.
   bool changed() const;
+  // Replaces the contents (a file converted from UTF-16).
+  void adopt(const std::string &text);
 
 private:
   struct impl;
   std::unique_ptr<impl> p_;
 };
+
+// Why a file cannot be read ("No such file or directory", ...).
+std::string open_failure_reason(const std::string &fname);
 
 // Turns a fault while reading the mapped input into an error instead of a
 // crash (see input.cpp).

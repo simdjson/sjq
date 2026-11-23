@@ -754,6 +754,19 @@ value get_path(const value &t, const path_t &p, size_t from = 0);
 void set_path(value &t, const path_t &p, size_t from, const value &v);
 value delete_paths(const value &t, std::vector<path_t> ps);
 
+// An error in the filter, at a byte offset of its text, with an optional
+// hint for the user.
+struct syntax_error : std::runtime_error {
+  size_t pos;
+  std::string hint;
+  syntax_error(const std::string &m, size_t at, std::string h = std::string())
+      : std::runtime_error(m), pos(at), hint(std::move(h)) {}
+};
+
+// Formats an error of compile(): the message, the line and column, the line
+// of the filter with a caret under the problem, and the hint.
+std::string describe_syntax_error(const std::string &src, const syntax_error &err);
+
 // What the driver needs to know about a filter.
 struct compile_info {
   bool uses_input{false};  // calls input or inputs

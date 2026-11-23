@@ -120,6 +120,42 @@ bool input_source::load(const std::string &fname, bool use_mmap) {
   return true;
 }
 
+void input_source::adopt(const std::string &text) {
+  if (p_->mapped) {
+    g_map_base.store(nullptr);
+    g_map_len.store(0);
+    p_->mapped = false;
+  }
+#if SIMDJSON_HAS_PADDED_MEMORY_MAP
+  p_->map.reset();
+#endif
+  p_->owned = simdjson::padded_string(text);
+  p_->p = p_->owned.data();
+  p_->n = p_->owned.size();
+}
+
+std::string open_failure_reason(const std::string &fname) {
+#if defined(_WIN32)
+  DWORD attr = GetFileAttributesA(fname.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES) {
+    DWORD e = GetLastError();
+    if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) { return "No such file or directory"; }
+    if (e == ERROR_ACCESS_DENIED) { return "Permission denied"; }
+    return "cannot access the file (Windows error " + std::to_string(e) + ")";
+  }
+  if (attr & FILE_ATTRIBUTE_DIRECTORY) { return "Is a directory"; }
+  return "cannot read the file";
+#else
+  struct stat st{};
+  if (stat(fname.c_str(), &st) != 0) { return strerror(errno); }
+  if (S_ISDIR(st.st_mode)) { return strerror(EISDIR); }
+  FILE *f = fopen(fname.c_str(), "rb");
+  if (!f) { return strerror(errno); }
+  fclose(f);
+  return "cannot read the file";
+#endif
+}
+
 bool input_source::load_stdin_file(bool use_mmap) {
   if (!use_mmap) { return false; }
 #if SIMDJSON_HAS_PADDED_MEMORY_MAP

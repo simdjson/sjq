@@ -1,11 +1,13 @@
 // sjq: a jq-compatible JSON processor built on simdjson.
 #include "ast.h"
 #include "builtins.h"
+#include "diagnose.h"
 #include "input.h"
 #include "ondemand.h"
 #include "writer.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -39,6 +41,7 @@ static void usage(FILE *f) {
           "      --tab                 indent with tabs\n"
           "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
           "  -f, --from-file file      read the filter from a file\n"
+          "  -o, --output file         write the output to a file (UTF-8, LF line ends)\n"
           "      --arg name value      set $name to the string value\n"
           "      --argjson name json   set $name to the JSON value\n"
           "      --slurpfile name file set $name to an array of the JSON values in file\n"
@@ -49,37 +52,60 @@ static void usage(FILE *f) {
           "      --unbuffered          flush after each input\n"
           "  -b, --binary              on Windows, write LF line ends (no CR)\n"
           "      --threads n           worker threads for large files (1: sequential)\n"
-          "      --no-od               do not use the On-Demand fast path\n"
+          "      --no-od               do not use the On-Demand fast path (check all the input)\n"
           "      --no-mmap             read files instead of mapping them\n"
           "  -V, --version\n"
-          "  -h, --help\n");
+          "  -h, --help\n"
+          "\n"
+          "With filters that only select (.a.b, select(...), {a, b}), sjq checks only the parts of the\n"
+          "input it reads; --no-od checks every document in full, as jq does.\n"
+          "On Windows, quoting a filter is hard in cmd and PowerShell 5: put it in a file and use -f FILE.\n"
+          "Documentation: https://simdjson.github.io/sjq/\n");
 }
 
-// Reads a whole file (or standard input for "-"); false when it cannot.
-static bool read_file(const std::string &name, std::string &out) {
+// Reads a whole file (or standard input for "-"); false when it cannot, with
+// the reason in why. UTF-16 with a byte order mark is converted to UTF-8.
+static bool read_file(const std::string &name, std::string &out, std::string &why) {
   out.clear();
   if (name == "-") {
     char buf[65536];
     while (true) {
       long long r = read_stdin(buf, sizeof(buf));
-      if (r < 0) { return false; }
-      if (r == 0) { return true; }
+      if (r < 0) {
+        why = "cannot read standard input";
+        return false;
+      }
+      if (r == 0) { break; }
       out.append(buf, size_t(r));
     }
+  } else {
+    input_source src;
+    if (!src.load(name, false)) {
+      why = open_failure_reason(name);
+      return false;
+    }
+    out.assign(src.data(), src.size());
   }
-  input_source src;
-  if (!src.load(name, false)) { return false; }
-  out.assign(src.data(), src.size());
+  std::string converted;
+  if (utf16_with_bom_to_utf8(out.data(), out.size(), converted)) { out.swap(converted); }
   return true;
 }
+
+static const char *const UTF16_ADVICE =
+    "the file seems to be in UTF-16 without a byte order mark (Windows PowerShell 5 writes UTF-16 with >): "
+    "save it as UTF-8, or write it with sjq -o FILE";
 
 // Parses every JSON value of text as owned values; false on a parse error.
 static bool parse_all(const std::string &text, std::vector<value> &out, std::string &err) {
   dom::parser parser;
   padded_string copy(text);
   dom::document_stream stream;
+  if (looks_like_utf16(text.data(), text.size())) {
+    err = UTF16_ADVICE;
+    return false;
+  }
   if (auto e = parser.parse_many(copy, std::max<size_t>(copy.size(), 1024)).get(stream)) {
-    err = error_message(e);
+    err = describe_json_error(text.data(), text.size(), e);
     return false;
   }
   for (auto it = stream.begin(); it != stream.end(); ++it) {
@@ -87,13 +113,13 @@ static bool parse_all(const std::string &text, std::vector<value> &out, std::str
     auto e = (*it).get(doc);
     if (e == EMPTY) { break; }
     if (e) {
-      err = error_message(e);
+      err = describe_json_error(text.data(), text.size(), e);
       return false;
     }
     out.push_back(to_owned(doc));
   }
   if (stream.truncated_bytes()) {
-    err = "Unfinished JSON term at EOF";
+    err = describe_json_error(text.data(), text.size(), TAPE_ERROR);
     return false;
   }
   return true;
@@ -135,6 +161,9 @@ static void setup_colors(std::string *colors) {
 simdjson_never_inline node_ptr compile_or_report(const std::string &filter, const std::vector<std::string> &globals, compile_info &info) {
   try {
     return compile(filter, globals, &info);
+  } catch (syntax_error &err) {
+    fprintf(stderr, "sjq: error: %s", describe_syntax_error(filter, err).c_str());
+    return nullptr;
   } catch (std::exception &ex) {
     fprintf(stderr, "sjq: error: %s\n", ex.what());
     return nullptr;
@@ -152,6 +181,7 @@ int main(int argc, char **argv) {
   std::string filter{};
   bool have_filter = false;
   std::string filter_file{};
+  std::string output_file{};
   std::vector<std::string> files{};
   // --arg and friends: the variables, in order, and $ARGS.
   std::vector<std::pair<std::string, value>> named{};
@@ -180,7 +210,7 @@ int main(int argc, char **argv) {
         std::vector<value> vs;
         std::string err;
         if (!parse_all(a, vs, err) || vs.size() != 1) {
-          fprintf(stderr, "sjq: invalid JSON text passed to --jsonargs\n");
+          fprintf(stderr, "sjq: invalid JSON text passed to --jsonargs: %s\n", err.empty() ? "one value expected" : err.c_str());
           return 2;
         }
         positional.push_back(vs[0]);
@@ -218,7 +248,7 @@ int main(int argc, char **argv) {
       std::vector<value> vs;
       std::string err;
       if (!parse_all(argv[i + 2], vs, err) || vs.size() != 1) {
-        fprintf(stderr, "sjq: invalid JSON text passed to --argjson\n");
+        fprintf(stderr, "sjq: invalid JSON text passed to --argjson %s: %s\n", argv[i + 1], err.empty() ? "one value expected" : err.c_str());
         return 2;
       }
       set_named(argv[i + 1], vs[0]);
@@ -226,9 +256,9 @@ int main(int argc, char **argv) {
     }
     else if (a == "--slurpfile" || a == "--rawfile") {
       need(i, 2, a);
-      std::string text;
-      if (!read_file(argv[i + 2], text)) {
-        fprintf(stderr, "sjq: error: could not open %s\n", argv[i + 2]);
+      std::string text, why;
+      if (!read_file(argv[i + 2], text, why)) {
+        fprintf(stderr, "sjq: error: could not open %s: %s\n", argv[i + 2], why.c_str());
         return 2;
       }
       if (a == "--rawfile") {
@@ -247,6 +277,7 @@ int main(int argc, char **argv) {
     else if (a == "--args") { rest_mode = 1; }
     else if (a == "--jsonargs") { rest_mode = 2; }
     else if (a == "--fractured") { w.fractured = true; }
+    else if (a == "-o" || a == "--output") { need(i, 1, a); output_file = argv[++i]; }
     else if (a == "--width") {
       need(i, 1, a);
       char *endp = nullptr;
@@ -299,10 +330,14 @@ int main(int argc, char **argv) {
     }
   }
   if (!filter_file.empty()) {
-    if (!read_file(filter_file, filter)) {
-      fprintf(stderr, "sjq: error: could not open %s\n", filter_file.c_str());
+    std::string why;
+    if (!read_file(filter_file, filter, why)) {
+      fprintf(stderr, "sjq: error: could not open %s: %s\n", filter_file.c_str(), why.c_str());
       return 2;
     }
+    // Some Windows editors, and PowerShell 5's Out-File -Encoding utf8, start
+    // the file with a byte order mark.
+    if (filter.compare(0, 3, "\xEF\xBB\xBF") == 0) { filter.erase(0, 3); }
     have_filter = true;
   }
   if (!have_filter) { usage(stderr); return 2; }
@@ -313,7 +348,19 @@ int main(int argc, char **argv) {
 
   static std::string colors[C_COUNT];
   const char *no_color = getenv("NO_COLOR");
-  const bool terminal = stdout_is_terminal();
+  // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
+  // that the shell does not re-encode the output (Windows PowerShell 5's >
+  // writes UTF-16).
+  FILE *output = nullptr;
+  if (!output_file.empty()) {
+    output = fopen(output_file.c_str(), "wb");
+    if (!output) {
+      fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), strerror(errno));
+      return 2;
+    }
+    w.out = output;
+  }
+  const bool terminal = !output && stdout_is_terminal();
   const bool can_color = prepare_console(binary);
   // The FracturedJson layout has no colors.
   w.color = !w.fractured && (color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color)));
@@ -360,7 +407,16 @@ int main(int argc, char **argv) {
     if (file_error) { return 2; }
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
+  };  // Writes what is left and checks that the output file was written.
+  auto finish = [&](int st) {
+    w.flush();
+    if (output && (ferror(output) || fclose(output) != 0)) {
+      fprintf(stderr, "sjq: error: could not write %s\n", output_file.c_str());
+      return 2;
+    }
+    return final_status(st);
   };
+
   // jq reports the number of lines consumed when an error happens. line_count
   // counts the newlines of the current buffer before line_pos.
   const char *line_base = nullptr;
@@ -422,9 +478,9 @@ int main(int argc, char **argv) {
         const std::string &fname = files[next_file++];
         current_name = fname;
         g_input_filename = fname == "-" ? nullptr : fname.c_str();
-        std::string text;
-        if (!read_file(fname, text)) {
-          fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+        std::string text, why;
+        if (!read_file(fname, text, why)) {
+          fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), why.c_str());
           file_error = true;
           continue;
         }
@@ -461,9 +517,9 @@ int main(int argc, char **argv) {
         if (raw_input) {
           std::string all;
           for (const auto &fname : files) {
-            std::string text;
-            if (!read_file(fname, text)) {
-              fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+            std::string text, why;
+            if (!read_file(fname, text, why)) {
+              fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), why.c_str());
               file_error = true;
               continue;
             }
@@ -500,14 +556,12 @@ int main(int argc, char **argv) {
       }
     }
     if (failed) { status = 2; }
-    w.flush();
-    return final_status(status);
+    return finish(status);
   }
 
   if (null_input) {
     run(value::null(), "<unknown>");
-    w.flush();
-    return final_status(status);
+    return finish(status);
   }
   if (use_mmap) { install_fault_handler(); }
   dom::parser parser{};
@@ -517,6 +571,20 @@ int main(int argc, char **argv) {
   const input_source *current = nullptr;
   auto input_changed = [&]() { return current && current->changed(); };
   bool fatal = false;  // a parse error ends the input, as in jq
+
+  // The message for invalid JSON in data[start, len): where the first problem
+  // is (line and column from the start of the input) and what it is.
+  auto json_error_text = [&](const char *data, size_t len, size_t start, error_code err) {
+    json_problem p = find_json_problem(data + start, len - start);
+    if (!p.found) { return "invalid JSON: " + plain_error(err); }
+    size_t at = start + p.offset;
+    count_lines_to(at);
+    size_t ls = at;
+    while (ls > 0 && data[ls - 1] != '\n') { ls--; }
+    size_t column = 1;
+    for (size_t k = ls; k < at; k++) { column += (static_cast<unsigned char>(data[k]) & 0xC0) != 0x80; }
+    return "invalid JSON at line " + std::to_string(line_count + 1) + ", column " + std::to_string(column) + ": " + p.message;
+  };
 
   // Filters the documents of data[offset, len). When at_eof is false, an
   // incomplete last document is left for later. Returns the offset where
@@ -540,7 +608,7 @@ int main(int argc, char **argv) {
         }
         if (err == EMPTY) { return false; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(err)); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, offset + index, err).c_str()); }
         status = 5;
         failed = fatal = true;
         return false;
@@ -571,7 +639,7 @@ int main(int argc, char **argv) {
             auto derr = parser.parse(src.data(), src.size(), true).get(el);
             if (derr) {
               w.flush();
-              if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(derr)); }
+              if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, size_t(src.data() - data), derr).c_str()); }
               status = 5;
               failed = fatal = true;
               break;
@@ -608,7 +676,7 @@ int main(int argc, char **argv) {
       if (truncated) {
         if (!at_eof) { return offset + slen - truncated; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): Unfinished JSON term at EOF\n", name); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, len - truncated, TAPE_ERROR).c_str()); }
         status = 5;
         fatal = true;
       }
@@ -741,8 +809,8 @@ int main(int argc, char **argv) {
       }
       cv_window.notify_all();
       if (!ok) { resume = starts[k]; break; }
-      fwrite(out.data(), 1, out.size(), stdout);
-      if (flush_each) { fflush(stdout); }
+      fwrite(out.data(), 1, out.size(), w.out);
+      if (flush_each) { fflush(w.out); }
     }
     for (auto &t : pool) { t.join(); }
     return resume;
@@ -855,6 +923,13 @@ int main(int argc, char **argv) {
       if (!fmt_known && cut > 0) {
         fmt = input_format(buf.data(), cut);
         fmt_known = true;
+        bool bom16 = cut >= 2 && ((static_cast<unsigned char>(buf[0]) == 0xFF && static_cast<unsigned char>(buf[1]) == 0xFE) ||
+                                  (static_cast<unsigned char>(buf[0]) == 0xFE && static_cast<unsigned char>(buf[1]) == 0xFF));
+        if (bom16 || looks_like_utf16(buf.data(), cut)) {
+          fprintf(stderr, "sjq: error (at %s): the input is in UTF-16: save it as UTF-8, or pass the file name to sjq\n", name);
+          file_error = true;
+          break;
+        }
       }
       line_base = buf.data();
       size_t consumed = cut == 0 ? 0 : run_sequential(buf.data(), cut, 0, eof, fmt, name);
@@ -869,6 +944,22 @@ int main(int argc, char **argv) {
     line_base = nullptr;
   };
 
+  // UTF-16 input: converted when it starts with a byte order mark, refused
+  // with an explanation otherwise.
+  auto check_encoding = [&](input_source &input, const char *name) {
+    std::string converted;
+    if (utf16_with_bom_to_utf8(input.data(), input.size(), converted)) {
+      input.adopt(converted);
+      return true;
+    }
+    if (looks_like_utf16(input.data(), input.size())) {
+      fprintf(stderr, "sjq: error (at %s): %s\n", name, UTF16_ADVICE);
+      file_error = true;
+      return false;
+    }
+    return true;
+  };
+
   for (const std::string &fname : files) {
     fatal = false;
     g_input_filename = fname == "-" ? nullptr : fname.c_str();
@@ -876,7 +967,7 @@ int main(int argc, char **argv) {
       if (stdin_is_regular_file()) {
         input_source input;
         if (input.load_stdin_file(use_mmap)) {
-          run_input(input, "<stdin>");
+          if (check_encoding(input, "<stdin>")) { run_input(input, "<stdin>"); }
           continue;
         }
       }
@@ -885,12 +976,12 @@ int main(int argc, char **argv) {
     }
     input_source input;
     if (!input.load(fname, use_mmap)) {
-      fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+      fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), open_failure_reason(fname).c_str());
       file_error = true;
       continue;
     }
+    if (!check_encoding(input, fname.c_str())) { continue; }
     run_input(input, fname.c_str());
   }
-  w.flush();
-  return final_status(status);
+  return finish(status);
 }

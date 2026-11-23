@@ -120,6 +120,7 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--fractured` | FracturedJson layout (see below) |
 | `--width n` | with `--fractured`, the maximal line length (default 120) |
 | `-f`, `--from-file file` | read the filter from a file |
+| `-o`, `--output file` | write the output to a file (UTF-8, LF line ends) |
 | `--arg name value` | set `$name` to a string |
 | `--argjson name json` | set `$name` to a JSON value |
 | `--slurpfile name file` | set `$name` to an array of the JSON values of a file |
@@ -129,7 +130,7 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--unbuffered` | flush the output after each input |
 | `-b`, `--binary` | on Windows, write LF line ends |
 | `--threads n` | worker threads for large files (1: sequential) |
-| `--no-od`, `--no-mmap` | turn off the On-Demand fast path, or memory mapping |
+| `--no-od`, `--no-mmap` | turn off the On-Demand fast path (check all the input), or memory mapping |
 | `-V`, `--version`, `-h`, `--help` | |
 
 The exit status is 0 on success, 2 for usage and file errors, 3 when the
@@ -157,6 +158,39 @@ $ sjq --fractured '.statuses[:4] | map({id, lang, rt: .retweet_count, user: .use
 `--width n` sets the line length (120 by default) and `--indent n` the
 indentation (2). It works with `-r`, `-S` and `-a`, not with `-c` or
 `--tab`, and without colors.
+
+### Invalid JSON
+
+When a filter only navigates and selects (`.a.b`, `.[]`, `select(.x > 1)`,
+`{id, name}`, `length`), sjq runs it on simdjson's On-Demand API, which parses
+only what the filter reads. The parts of a document the filter skips are not
+fully checked: `sjq .a` prints `1` for `{"a": 1, "b": tru}`, where jq reports
+an error. Some errors are caught everywhere, because simdjson checks the whole
+document for them: invalid UTF-8, unclosed strings, unbalanced brackets. With
+`--no-od`, or with any filter that needs the general evaluator, every document
+is checked in full, as jq does. Errors are reported with a line and a column:
+
+```
+$ echo '{"a": 1, "b": [1, 2}' | sjq --no-od .a
+sjq: error (at <stdin>): invalid JSON at line 1, column 20: expected ',' or ']' but found '}'
+```
+
+### Windows: quoting {#windows}
+
+The jq language uses double quotes and characters that Windows shells treat
+specially.
+
+- In the Command Prompt (cmd), single quotes are not quotes: write
+  `sjq ".a" file.json`, with `\"` for a double quote inside the filter
+  (`sjq "select(.name == \"x\")" file.json`).
+- Windows PowerShell 5 removes the double quotes inside an argument passed to
+  a program: `'."année"'` reaches sjq as `.année`. PowerShell 7 does not.
+- In both, the simplest is to put the filter in a file and use `-f`:
+  `sjq -f filter.jq file.json`. A byte order mark at the start of the file is
+  fine.
+- Windows PowerShell 5's `>` writes UTF-16. sjq reads UTF-16 files that start
+  with a byte order mark, but other programs may not: use `-o out.json`, and
+  sjq writes the file itself, in UTF-8.
 
 ## Performance {#performance}
 
@@ -249,6 +283,8 @@ unchanged.
 - No modules (`import`, `include`) and no `--stream`; `input_line_number`
   is always 0. sjq also has `@base32`, `@base32d`, `leaf_paths` and
   `toarray`, which jq 1.8.2 lacks.
+- Filters that only navigate and select do not check the parts of the input
+  they skip (see [Invalid JSON](#invalid-json)); `--no-od` checks everything.
 - Objects with duplicate keys: `.a` finds the first `"a"`, `.` prints every
   pair; jq keeps the last value.
 - Values nested more than 10,000 levels deep end with an error.

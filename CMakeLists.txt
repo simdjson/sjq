@@ -44,6 +44,7 @@ endif()
 # The engine, shared by the executable and the fuzzer.
 add_library(sjq-core STATIC
   src/builtins.cpp
+  src/diagnose.cpp
   src/input.cpp
   src/ondemand.cpp
   src/parser.cpp
