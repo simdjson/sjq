@@ -746,13 +746,40 @@ int main(int argc, char **argv) {
     return stream_format::whitespace_delimited;
   };
 
+  // The parallel path cuts the input after newlines, about every megabyte. A
+  // single large document (pretty-printed JSON) makes every chunk fail, and
+  // the workers parse them for nothing before the input goes to the
+  // sequential path. The first chunk tells: if it does not hold complete
+  // documents, the input is not newline-delimited and stays sequential.
+  auto first_chunk_is_documents = [&](const input_source &input) {
+    const size_t probe = size_t(1) << 20;
+    const void *nl = memchr(input.data() + probe, '\n', input.size() - probe);
+    if (!nl) { return false; }
+    size_t len = size_t(static_cast<const char *>(nl) - input.data()) + 1;
+    // The bytes after the chunk are part of the input: the padding the
+    // parser reads past len is there.
+    dom::document_stream stream;
+    if (parser.parse_many(reinterpret_cast<const uint8_t *>(input.data()), len, len).get(stream)) { return false; }
+    size_t docs = 0;
+    for (auto it = stream.begin(); it != stream.end(); ++it) {
+      dom::element doc;
+      auto err = (*it).get(doc);
+      if (err == EMPTY) { break; }
+      if (err) { return false; }
+      docs++;
+    }
+    return docs > 0 && stream.truncated_bytes() == 0;
+  };
+
   auto run_input = [&](const input_source &input, const char *name) {
     current = &input;
     line_base = input.data();
     line_pos = line_count = doc_end = 0;
     stream_format fmt = input_format(input.data(), input.size());
     size_t offset = 0;
-    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(4) << 20)) {
+    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(4) << 20) &&
+        first_chunk_is_documents(input)) {
+      if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel\n"); }
       w.flush();
       offset = run_parallel(input);
       if (offset == input.size()) { status = 0; }

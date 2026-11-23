@@ -307,6 +307,19 @@ def targeted(sjq, data, tmp):
     code, out, _ = run([sjq, "-c", ".", pretty_path])
     check("pretty stream parallel fallback", code == 0 and out == want_c, f"exit {code}")
 
+    # Only newline-delimited input goes to the worker threads: one large
+    # pretty-printed document, or pretty-printed documents, stay sequential.
+    code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1"})
+    check("parallel path for NDJSON", code == 0 and b"sjq: parallel" in err, f"exit {code} {err!r}")
+    one_doc = os.path.join(tmp, "one.json")
+    with open(one_doc, "w") as f:
+        json.dump({"docs": docs[:40000]}, f, indent=2)
+    code, out, err = run([sjq, ".docs | length", one_doc], env={"SJQ_DEBUG": "1"})
+    check("no parallel path for one large document", code == 0 and out == b"40000\n" and b"sjq: parallel" not in err,
+          f"exit {code} {out!r} {err!r}")
+    code, _, err = run([sjq, "-c", ".", pretty_path], env={"SJQ_DEBUG": "1"})
+    check("no parallel path for pretty-printed documents", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
+
     # An error in the middle stops the output there.
     bad = nd.split(b"\n")
     bad_doc = b"\n".join(bad[:60000]) + b'\n{"i": [1 2]}\n' + b"\n".join(bad[60000:])
