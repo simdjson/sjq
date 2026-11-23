@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -38,9 +39,16 @@ private:
   std::unique_ptr<impl> p_;
 };
 
-// Puts the file from in place of the file to (replacing it, atomically on
-// POSIX); false when it cannot.
-bool replace_file(const std::string &from, const std::string &to);
+// -o FILE. Why FILE cannot be written (empty when it can), checked before
+// the run without changing FILE.
+std::string output_problem(const std::string &fname);
+// A temporary file without a name, opened for reading and writing, which
+// disappears when it is closed or when sjq ends.
+FILE *anonymous_temporary_file();
+// Copies the content of tmp into FILE, opened as the shell's > opens it
+// (through a symbolic link, keeping the permissions, owner, links and ACLs
+// of an existing file); false with the reason in why when it cannot.
+bool copy_into_file(FILE *tmp, const std::string &fname, std::string &why);
 
 // Why a file cannot be read ("No such file or directory", ...).
 std::string open_failure_reason(const std::string &fname);

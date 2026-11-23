@@ -311,6 +311,38 @@ def targeted(sjq, data, tmp):
         check(f"-o keeps the file after a {label}", code != 0 and kept == b'{"c":1}\n', f"exit {code} {kept!r} {err!r}")
     leftovers = [n for n in os.listdir(tmp) if ".sjq-" in n]
     check("-o leaves no temporary file", not leftovers, repr(leftovers))
+    # An error on one input, then success on the next, is still a failed run.
+    two = os.path.join(tmp, "two.ndjson")
+    with open(two, "wb") as f:
+        f.write(b"1\n2\n")
+    code, _, err = run([sjq, "-o", dpath, 'if .==1 then error("x") else . end', two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("-o keeps the file after an error on an earlier input", kept == b'{"c":1}\n', f"exit {code} {kept!r} {err!r}")
+    badj = os.path.join(tmp, "bad-array.json")
+    with open(badj, "wb") as f:
+        f.write(b"[1,\n")
+    code, _, err = run([sjq, "-o", dpath, ".", badj, two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("invalid input, then valid input: exit 5 and -o unchanged", code == 5 and kept == b'{"c":1}\n', f"exit {code} {kept!r}")
+    code, _, _ = run([sjq, "-o", dpath, "-n", "1, halt, 2"])
+    with open(dpath, "rb") as f:
+        written = f.read()
+    check("-o with halt keeps the output so far", code == 0 and written == b"1\n", f"exit {code} {written!r}")
+    if sys.platform != "win32":
+        real = os.path.join(tmp, "real.json")
+        link = os.path.join(tmp, "link.json")
+        with open(real, "wb") as f:
+            f.write(b'{"a": 1}')
+        os.chmod(real, 0o600)
+        os.symlink("real.json", link)
+        code, _, err = run([sjq, "-c", "-o", link, ".a = 2", link])
+        with open(real, "rb") as f:
+            written = f.read()
+        check("-o writes through a symbolic link", code == 0 and os.path.islink(link) and written == b'{"a":2}\n',
+              f"exit {code} {written!r} {err!r}")
+        check("-o keeps the permissions", (os.stat(real).st_mode & 0o777) == 0o600, oct(os.stat(real).st_mode))
 
     # Errors in strings of filters point at the escape, or at the end.
     code, _, err = run([sjq, "-n", '"abc\\q"'])
@@ -331,6 +363,8 @@ def targeted(sjq, data, tmp):
         f.write("line\n".encode("utf-16-le"))
     code, _, err = run([sjq, "-R", ".", u16])
     check("UTF-16 with -R", code == 2 and b"UTF-16" in err, f"exit {code} {err!r}")
+    p = subprocess.run([sjq, "."], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=b"1\x00\n\x00", timeout=TIMEOUT)
+    check("short UTF-16 through a pipe", p.returncode == 2 and b"UTF-16" in p.stderr, f"exit {p.returncode} {p.stderr!r}")
 
     # A stream given by name (process substitution, a FIFO).
     if sys.platform != "win32" and hasattr(os, "mkfifo"):

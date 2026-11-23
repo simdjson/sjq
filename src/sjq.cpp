@@ -42,8 +42,8 @@ static void usage(FILE *f) {
           "      --tab                 indent with tabs\n"
           "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
           "  -f, --from-file file      read the filter from a file\n"
-          "  -o, --output file         write the output to a file (UTF-8, LF line ends), replaced\n"
-          "                            at the end of a successful run (it can be an input)\n"
+          "  -o, --output file         write the output to a file (UTF-8, LF line ends) at the end\n"
+          "                            of a successful run (it can be an input)\n"
           "      --arg name value      set $name to the string value\n"
           "      --argjson name json   set $name to the JSON value\n"
           "      --slurpfile name file set $name to an array of the JSON values in file\n"
@@ -358,7 +358,6 @@ int main(int argc, char **argv) {
   const char *no_color = getenv("NO_COLOR");
   // -o FILE: opened once the filter compiles (see below).
   FILE *output = nullptr;
-  std::string output_tmp{};
   const bool terminal = output_file.empty() && stdout_is_terminal();
   const bool can_color = prepare_console(binary);
   // The FracturedJson layout has no colors.
@@ -378,15 +377,21 @@ int main(int argc, char **argv) {
 
   // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
   // that the shell does not re-encode the output (Windows PowerShell 5's >
-  // writes UTF-16). It writes a temporary file next to it, which replaces
-  // FILE at the end of a successful run: FILE can also be an input
-  // (sjq -o data.json ... data.json), and a failed run leaves it as it was.
+  // writes UTF-16). The output goes to an anonymous temporary file (gone
+  // when sjq ends, even when interrupted), copied into FILE at the end of a
+  // successful run. FILE can then also be an input (sjq -o data.json ...
+  // data.json), a failed run leaves it as it was, and FILE is written as the
+  // shell's > writes it: through a symbolic link, keeping its permissions,
+  // owner, links and ACLs.
   if (!output_file.empty()) {
-    output_tmp = output_file + ".sjq-" + std::to_string(unsigned(time(nullptr))) + "-" +
-                 std::to_string(reinterpret_cast<uintptr_t>(&output_tmp) & 0xFFFFF) + ".tmp";
-    output = fopen(output_tmp.c_str(), "wb");
+    std::string why = output_problem(output_file);
+    if (!why.empty()) {
+      fprintf(stderr, "sjq: error: cannot write %s: %s\n", output_file.c_str(), why.c_str());
+      return 2;
+    }
+    output = anonymous_temporary_file();
     if (!output) {
-      fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), strerror(errno));
+      fprintf(stderr, "sjq: error: cannot create a temporary file for %s: %s\n", output_file.c_str(), strerror(errno));
       return 2;
     }
     w.out = output;
@@ -408,6 +413,15 @@ int main(int argc, char **argv) {
   // As jq: an input that cannot be opened, read or parsed makes the exit
   // status 2, whatever happens with the other inputs.
   bool file_error = false;
+  // Any error (a filter that fails, invalid input): unlike status, which
+  // follows jq (the status of the last input), it stays set.
+  bool any_error = false;
+  // As jq: invalid JSON makes the exit status 5, even when later inputs
+  // succeed.
+  bool parse_error = false;
+  // halt and halt_error: the processing stops and sjq ends with this status.
+  bool halted = false;
+  int halt_status = 0;
   int last_output = -1;  // -e: -1 no output, 0 false or null, 1 other
   auto emit = [&](const value &v) {
     if (seq) { w.put('\x1e'); }
@@ -420,31 +434,35 @@ int main(int argc, char **argv) {
   };
   auto final_status = [&](int st) {
     if (file_error) { return 2; }
+    if (parse_error) { return 5; }
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
   };
-  // -o: puts the temporary file in place (keep) or removes it. Returns false
-  // when the file could not be written.
+  // -o: copies the temporary file into the target (keep), or drops it.
+  // Returns false when the target could not be written.
   auto close_output = [&](bool keep) {
     if (!output) { return true; }
-    bool ok = !ferror(output);
-    ok = fclose(output) == 0 && ok;
+    FILE *tmp = output;
     output = nullptr;
-    if (ok && keep && replace_file(output_tmp, output_file)) { return true; }
-    std::remove(output_tmp.c_str());
-    if (!ok || keep) {
-      fprintf(stderr, "sjq: error: could not write %s\n", output_file.c_str());
-      return false;
+    if (!keep) {
+      fclose(tmp);
+      fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file.c_str());
+      return true;
     }
-    fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file.c_str());
-    return true;
+    std::string why;
+    bool ok = fflush(tmp) == 0 && !ferror(tmp) && copy_into_file(tmp, output_file, why);
+    fclose(tmp);
+    if (!ok) { fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), why.c_str()); }
+    return ok;
   };
   // Writes what is left and checks that the output file was written.
   auto finish = [&](int st) {
     w.flush();
+    if (halted) { return close_output(true) ? halt_status : 2; }
     int fs = final_status(st);
-    // With -e, 1 and 4 describe the output: the run itself succeeded.
-    bool success = fs == 0 || (exit_status && (fs == 1 || fs == 4));
+    // With -e, the statuses 1 and 4 describe the output: the run succeeded
+    // when no error happened.
+    bool success = !any_error && !file_error && (fs == 0 || (exit_status && (fs == 1 || fs == 4)));
     if (!close_output(success)) { return 2; }
     return fs;
   };
@@ -478,21 +496,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), err.what());
       }
       status = 5;
+      any_error = true;
     } catch (halt_signal &h) {
       w.flush();
       fputs(h.message.c_str(), stderr);
       fflush(stderr);
-      // halt and halt_error end the program as asked: the output so far is
-      // kept.
-      exit(close_output(true) ? h.code : 2);
+      // halt and halt_error end the program as asked, with the output so
+      // far: the loops stop, the inputs are released, then main ends.
+      halted = true;
+      halt_status = h.code;
     } catch (break_signal &) {
       w.flush();
       fprintf(stderr, "sjq: error (at %s): break\n", name);
       status = 5;
+      any_error = true;
     } catch (std::exception &ex) {
       w.flush();
       fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), ex.what());
       status = 5;
+      any_error = true;
     }
   };
 
@@ -584,12 +606,15 @@ int main(int argc, char **argv) {
       run(value::null(), "<unknown>");
     } else {
       value v;
-      while (next_value(v)) {
+      while (!halted && next_value(v)) {
         value in = std::move(v);
         run(in, current_name == "-" ? "<stdin>" : current_name.c_str());
       }
     }
-    if (failed) { status = 2; }
+    if (failed) {
+      status = 2;
+      any_error = true;
+    }
     return finish(status);
   }
 
@@ -644,6 +669,8 @@ int main(int argc, char **argv) {
         w.flush();
         if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, offset + index, err).c_str()); }
         status = 5;
+        any_error = true;
+        parse_error = true;
         failed = fatal = true;
         return false;
       };
@@ -675,10 +702,16 @@ int main(int argc, char **argv) {
               w.flush();
               if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, size_t(src.data() - data), derr).c_str()); }
               status = 5;
+              any_error = true;
+              parse_error = true;
               failed = fatal = true;
               break;
             }
             run(value::of(el), name);
+            if (halted) {
+              fatal = true;
+              break;
+            }
           }
           if (flush_each) { w.flush(); } else { w.maybe_flush(); }
         }
@@ -703,6 +736,10 @@ int main(int argc, char **argv) {
           if (end < len && data[end] == '\n') { end++; }
           doc_end = end;
           run(value::of(doc), name);
+          if (halted) {
+            fatal = true;
+            break;
+          }
           if (flush_each) { w.flush(); } else { w.maybe_flush(); }
         }
         if (!retry && !failed) { truncated = stream.truncated_bytes(); }
@@ -712,6 +749,8 @@ int main(int argc, char **argv) {
         w.flush();
         if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, len - truncated, TAPE_ERROR).c_str()); }
         status = 5;
+        any_error = true;
+        parse_error = true;
         fatal = true;
       }
       if (failed) { return len; }
@@ -964,10 +1003,18 @@ int main(int argc, char **argv) {
           // whole input is read and converted, then filtered.
           std::string all(buf.data(), filled);
           char more[65536];
+          bool read_failed = false;
           while (!eof) {
             long long r = read_stdin(more, sizeof(more));
+            if (r < 0) { read_failed = true; }
             if (r <= 0) { break; }
             all.append(more, size_t(r));
+          }
+          if (read_failed) {
+            fprintf(stderr, "sjq: error: cannot read %s\n", name);
+            file_error = true;
+            fatal = true;
+            break;
           }
           std::string converted;
           utf16_with_bom_to_utf8(all.data(), all.size(), converted);
@@ -976,7 +1023,9 @@ int main(int argc, char **argv) {
           run_input(converted_input, name);
           break;
         }
-        if (looks_like_utf16(buf.data(), cut)) {
+        // All that was read, not only the complete lines: a producer can
+        // pause after a line in UTF-16 ("1\n" is 31 00 0A 00).
+        if (looks_like_utf16(buf.data(), filled)) {
           fprintf(stderr, "sjq: error (at %s): %s\n", name, UTF16_ADVICE);
           file_error = true;
           break;
@@ -1012,6 +1061,7 @@ int main(int argc, char **argv) {
   };
 
   for (const std::string &fname : files) {
+    if (halted) { break; }
     fatal = false;
     g_input_filename = fname == "-" ? nullptr : fname.c_str();
     if (fname == "-") {

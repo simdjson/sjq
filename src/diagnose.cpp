@@ -335,7 +335,8 @@ bool looks_like_utf16(const char *text, size_t len) {
   // ASCII text in UTF-16 has a NUL byte next to each character.
   size_t probe = len < 64 ? len : 64, nul = 0;
   for (size_t k = 0; k < probe; k++) { nul += text[k] == 0; }
-  return probe >= 4 && nul * 3 >= probe;
+  // JSON text has no NUL byte: a few bytes are enough.
+  return probe >= 2 && nul * 3 >= probe;
 }
 
 } // namespace sjq

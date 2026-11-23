@@ -149,14 +149,87 @@ void input_source::adopt(const std::string &text) {
   p_->n = p_->owned.size();
 }
 
-bool replace_file(const std::string &from, const std::string &to) {
+std::string output_problem(const std::string &fname) {
 #if defined(_WIN32)
-  // The process code page is UTF-8 (see sjq.manifest): the A function takes
+  // The process code page is UTF-8 (see sjq.manifest): the A functions take
   // any file name.
-  return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+  DWORD attr = GetFileAttributesA(fname.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES) { return ""; }  // a new file
+  if (attr & FILE_ATTRIBUTE_DIRECTORY) { return "it is a directory"; }
+  if (attr & FILE_ATTRIBUTE_READONLY) { return "the file is read-only"; }
+  HANDLE h = CreateFileA(fname.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) { return "permission denied"; }
+  CloseHandle(h);
+  return "";
 #else
-  return rename(from.c_str(), to.c_str()) == 0;
+  struct stat st{};
+  if (stat(fname.c_str(), &st) == 0) {
+    if (S_ISDIR(st.st_mode)) { return strerror(EISDIR); }
+    if (access(fname.c_str(), W_OK) != 0) { return strerror(errno); }
+    return "";
+  }
+  if (errno != ENOENT) { return strerror(errno); }
+  // A new file: its directory must accept it.
+  size_t slash = fname.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : fname.substr(0, slash));
+  if (access(dir.c_str(), W_OK | X_OK) != 0) { return strerror(errno); }
+  return "";
 #endif
+}
+
+FILE *anonymous_temporary_file() {
+#if defined(_WIN32)
+  wchar_t dir[MAX_PATH + 1], path[MAX_PATH + 1];
+  DWORD n = GetTempPathW(MAX_PATH + 1, dir);
+  if (n == 0 || n > MAX_PATH || GetTempFileNameW(dir, L"sjq", 0, path) == 0) { return nullptr; }
+  // GetTempFileNameW created the file with a unique name; it is deleted when
+  // its last handle closes, also when sjq is interrupted.
+  HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
+                         FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    DeleteFileW(path);
+    return nullptr;
+  }
+  int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_BINARY);
+  if (fd < 0) {
+    CloseHandle(h);
+    return nullptr;
+  }
+  FILE *f = _fdopen(fd, "w+b");
+  if (!f) { _close(fd); }
+  return f;
+#else
+  return tmpfile();
+#endif
+}
+
+bool copy_into_file(FILE *tmp, const std::string &fname, std::string &why) {
+  if (fseek(tmp, 0, SEEK_SET) != 0) {
+    why = strerror(errno);
+    return false;
+  }
+  FILE *out = fopen(fname.c_str(), "wb");
+  if (!out) {
+    why = strerror(errno);
+    return false;
+  }
+  char buf[65536];
+  size_t got;
+  bool ok = true;
+  while ((got = fread(buf, 1, sizeof(buf), tmp)) > 0) {
+    if (fwrite(buf, 1, got, out) != got) {
+      ok = false;
+      break;
+    }
+  }
+  if (ok && ferror(tmp)) { ok = false; }
+  if (!ok) { why = strerror(errno); }
+  if (fclose(out) != 0 && ok) {
+    why = strerror(errno);
+    ok = false;
+  }
+  return ok;
 }
 
 std::string open_failure_reason(const std::string &fname) {

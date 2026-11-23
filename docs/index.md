@@ -130,7 +130,7 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--fractured` | FracturedJson layout (see below) |
 | `--width n` | with `--fractured`, the maximal line length (default 120) |
 | `-f`, `--from-file file` | read the filter from a file |
-| `-o`, `--output file` | write the output to a file (UTF-8, LF line ends); the file is replaced at the end of a successful run, so it can also be an input, and a failed run leaves it unchanged |
+| `-o`, `--output file` | write the output to a file (UTF-8, LF line ends), at the end of a successful run: the file can also be an input, and a run with an error leaves it unchanged. It is written like the shell's `>` writes it (through a symbolic link, keeping its permissions) |
 | `--arg name value` | set `$name` to a string |
 | `--argjson name json` | set `$name` to a JSON value |
 | `--slurpfile name file` | set `$name` to an array of the JSON values of a file |
