@@ -52,7 +52,7 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
 
   windows-mingw:
-    name: windows-mingw64
+    name: windows-ucrt64
     runs-on: windows-latest
     defaults:
       run:
@@ -64,8 +64,8 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           update: true
-          msystem: MINGW64
-          install: mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gcc mingw-w64-x86_64-python
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
       - name: Build and test
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DSJQ_WERROR=ON
@@ -97,3 +97,32 @@ jobs:
             crash-*
             timeout-*
             oom-*
+
+  # The install scripts, against the latest release.
+  install-windows:
+    name: install-ps1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Windows PowerShell 5
+        shell: powershell
+        run: |
+          $env:SJQ_INSTALL_DIR = "$env:RUNNER_TEMP\sjq5"
+          Get-Content -Raw .\install.ps1 | Invoke-Expression
+          sjq --version
+          '{"a": 1}' | sjq .a
+      - name: PowerShell 7
+        shell: pwsh
+        run: |
+          $env:SJQ_INSTALL_DIR = "$env:RUNNER_TEMP\sjq7"
+          Get-Content -Raw ./install.ps1 | Invoke-Expression
+          sjq --version
+  install-unix:
+    name: install-sh
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: install.sh
+        run: |
+          SJQ_INSTALL_DIR="$RUNNER_TEMP/sjq" sh install.sh
+          "$RUNNER_TEMP/sjq/sjq" --version

@@ -2,6 +2,8 @@
 #
 #   irm https://raw.githubusercontent.com/simdjson/sjq/main/install.ps1 | iex
 #
+# sjq works in the same window right away, and in new ones (user PATH).
+#
 # Environment:
 #   SJQ_VERSION      a release tag such as v0.1.0 (default: the latest release)
 #   SJQ_INSTALL_DIR  where to put sjq.exe (default: %LOCALAPPDATA%\Programs\sjq)
@@ -39,6 +41,10 @@ if (-not $userPath) { $userPath = '' }
 if (-not (($userPath -split ';') -contains $dir)) {
   $newPath = if ($userPath) { $userPath.TrimEnd(';') + ";$dir" } else { $dir }
   [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-  Write-Host "Added $dir to your user PATH (open a new terminal to use it)."
+  Write-Host "Added $dir to your user PATH."
+}
+# This window too: through irm | iex, the script runs in the current session.
+if (-not (($env:Path -split ';') -contains $dir)) {
+  $env:Path = $env:Path.TrimEnd(';') + ";$dir"
 }
 & (Join-Path $dir 'sjq.exe') --version
