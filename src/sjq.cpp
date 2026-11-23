@@ -34,6 +34,8 @@ static void usage(FILE *f) {
           "  -S, --sort-keys           sort object keys\n"
           "  -C, --color-output        colorize output (default when stdout is a terminal)\n"
           "  -M, --monochrome-output\n"
+          "      --fractured           FracturedJson layout: compact lines, tables of similar records\n"
+          "      --width n             with --fractured, the maximal line length (default 120)\n"
           "      --tab                 indent with tabs\n"
           "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
           "  -f, --from-file file      read the filter from a file\n"
@@ -244,6 +246,14 @@ int main(int argc, char **argv) {
     }
     else if (a == "--args") { rest_mode = 1; }
     else if (a == "--jsonargs") { rest_mode = 2; }
+    else if (a == "--fractured") { w.fractured = true; }
+    else if (a == "--width") {
+      need(i, 1, a);
+      char *endp = nullptr;
+      long n = strtol(argv[++i], &endp, 10);
+      if (*endp || n < 1) { fprintf(stderr, "sjq: --width takes a positive number\n"); return 2; }
+      w.fractured_width = size_t(n);
+    }
     else if (a == "--tab") { w.tab = true; w.pretty = true; }
     else if (a == "--indent") {
       if (i + 1 >= argc) { fprintf(stderr, "sjq: --indent takes one parameter\n"); return 2; }
@@ -296,12 +306,17 @@ int main(int argc, char **argv) {
     have_filter = true;
   }
   if (!have_filter) { usage(stderr); return 2; }
+  if (w.fractured && (!w.pretty || w.tab)) {
+    fprintf(stderr, "sjq: --fractured cannot be combined with -c or --tab\n");
+    return 2;
+  }
 
   static std::string colors[C_COUNT];
   const char *no_color = getenv("NO_COLOR");
   const bool terminal = stdout_is_terminal();
   const bool can_color = prepare_console(binary);
-  w.color = color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color));
+  // The FracturedJson layout has no colors.
+  w.color = !w.fractured && (color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color)));
   if (w.color) {
     setup_colors(colors);
     w.colors = colors;
@@ -324,7 +339,7 @@ int main(int argc, char **argv) {
   // std::regex: they stay on the main thread with its large stack.
   if (exit_status || info.uses_regex) { threads = 1; }
   od_ptr plan{};
-  if (use_od && !w.sort_keys && !w.ascii && !raw0 && !exit_status) { plan = od_compile(prog.get()); }
+  if (use_od && !w.sort_keys && !w.ascii && !raw0 && !exit_status && !w.fractured) { plan = od_compile(prog.get()); }
   if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: %s path\n", plan ? "On-Demand" : "DOM"); }
 
   int status = 0;
@@ -335,7 +350,7 @@ int main(int argc, char **argv) {
   auto emit = [&](const value &v) {
     if (seq) { w.put('\x1e'); }
     if (raw && v.k == K::Str) { w.put(get_str(v)); }
-    else { w.write_value(v, 0); }
+    else { write_output(w, v); }
     if (raw0) { w.put('\0'); }
     else if (!join) { w.put('\n'); }
     last_output = truthy(v) ? 1 : 0;
@@ -650,7 +665,7 @@ int main(int argc, char **argv) {
       auto lemit = [&](const value &v) {
         if (seq) { lw.put('\x1e'); }
         if (raw && v.k == K::Str) { lw.put(get_str(v)); }
-        else { lw.write_value(v, 0); }
+        else { write_output(lw, v); }
         if (raw0) { lw.put('\0'); }
         else if (!join) { lw.put('\n'); }
       };

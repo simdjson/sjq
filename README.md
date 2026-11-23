@@ -68,6 +68,10 @@ sjq implements the jq 1.8 language:
 - destructuring, regular expressions and dates
 - `input`/`inputs`, and most options, including `--arg`, `--argjson`, `-s` and `-R`.
 
+sjq also writes JSON in the compact yet readable
+[FracturedJson](https://github.com/j-brooke/FracturedJson) layout
+(`--fractured`).
+
 728 of the 781 tests of jq's own test suite pass, and the
 [jq tutorial](https://jqlang.org/tutorial/) runs unchanged. The differences
 are listed in the [documentation](https://simdjson.github.io/sjq/#language).

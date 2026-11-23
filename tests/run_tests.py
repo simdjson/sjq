@@ -249,6 +249,22 @@ def targeted(sjq, data, tmp):
     check("empty input", run([sjq, "."], b"") == (0, b"", b""))
     check("blank input", run([sjq, "."], b"  \n ") == (0, b"", b""))
 
+    # --fractured (simdjson's FracturedJson layout).
+    rows = b'[{"id":1,"name":"a","n":10},{"id":22,"name":"bbb","n":3}]'
+    code, out, err = run([sjq, "--fractured", "--width", "40", "."], rows)
+    check("--fractured table", code == 0 and out == b'[\n  {"id": 1 , "name": "a",   "n": 10},\n  {"id": 22, "name": "bbb", "n": 3 }\n]\n',
+          f"exit {code} {out!r} {err!r}")
+    code, out, _ = run([sjq, "--fractured", "--width", "30", "[range(20)]", "-n"])
+    check("--fractured --width", code == 0 and max(len(l) for l in out.split(b"\n")) <= 30 and out.count(b"\n") > 2, f"exit {code} {out!r}")
+    code, out, _ = run([sjq, "--fractured", "-S", "-a", "--indent", "4", "{b: \"\u00e9\", a: [1, {c: null}], d: {e: [1, 2]}}", "-n"])
+    check("--fractured -S -a --indent", code == 0 and out == b'{\n    "a": [ 1, {"c": null} ],\n    "b": "\\u00e9",\n    "d": { "e": [1, 2] }\n}\n',
+          f"exit {code} {out!r}")
+    code, out, _ = run([sjq, "--fractured", "-r", ".[]"], b'["x", {"a": 1}]')
+    check("--fractured -r", code == 0 and out == b'x\n{"a": 1}\n', f"exit {code} {out!r}")
+    check("--fractured -c rejected", run([sjq, "--fractured", "-c", "."], b"1")[0] == 2)
+    check("--fractured --tab rejected", run([sjq, "--fractured", "--tab", "."], b"1")[0] == 2)
+    check("--width 0 rejected", run([sjq, "--fractured", "--width", "0", "."], b"1")[0] == 2)
+
     # A stack too small for the On-Demand writer: the DOM path runs the
     # document again, and either succeeds or reports the error, never aborts.
     if os.name == "posix":
@@ -306,6 +322,12 @@ def targeted(sjq, data, tmp):
     want_c = "".join(json.dumps(d, separators=(",", ":")) + "\n" for d in docs[:40000]).encode()
     code, out, _ = run([sjq, "-c", ".", pretty_path])
     check("pretty stream parallel fallback", code == 0 and out == want_c, f"exit {code}")
+
+    # --fractured: the same output from the worker threads and sequentially.
+    code1, out1, _ = run([sjq, "--fractured", "{i, a, o}", nd_path])
+    code2, out2, _ = run([sjq, "--threads", "1", "--fractured", "{i, a, o}", nd_path])
+    check("--fractured parallel and sequential", code1 == 0 and code2 == 0 and out1 == out2 and out1.startswith(b'{ "i": 0, "a": [0, 0], "o": {"k": "0"} }\n'),
+          f"exit {code1} {code2} {out1[:80]!r} {out2[:80]!r}")
 
     # Only newline-delimited input goes to the worker threads: one large
     # pretty-printed document, or pretty-printed documents, stay sequential.

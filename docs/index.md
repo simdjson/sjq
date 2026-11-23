@@ -117,6 +117,8 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `-S`, `--sort-keys` | sort the keys of objects |
 | `-C`, `--color-output` / `-M`, `--monochrome-output` | force or disable colors (on by default on a terminal; `NO_COLOR` and `JQ_COLORS` are honored) |
 | `--tab`, `--indent n` | indent with a tab or with n spaces (0 to 7) |
+| `--fractured` | FracturedJson layout (see below) |
+| `--width n` | with `--fractured`, the maximal line length (default 120) |
 | `-f`, `--from-file file` | read the filter from a file |
 | `--arg name value` | set `$name` to a string |
 | `--argjson name json` | set `$name` to a JSON value |
@@ -133,6 +135,28 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 The exit status is 0 on success, 2 for usage and file errors, 3 when the
 filter does not compile and 5 when the last input fails with an error, as
 with jq.
+
+### Beyond jq: the FracturedJson layout
+
+With `--fractured`, sjq writes JSON with simdjson's implementation of the
+[FracturedJson](https://github.com/j-brooke/FracturedJson) layout: as compact
+as the content allows while staying readable. Short arrays and objects stay on
+one line, long arrays of simple values wrap, and arrays of similar records
+become aligned tables:
+
+```
+$ sjq --fractured '.statuses[:4] | map({id, lang, rt: .retweet_count, user: .user.screen_name})' twitter.json
+[
+  {"id": 505874924095815681, "lang": "ja", "rt": 0 , "user": "ayuu0123"   },
+  {"id": 505874922023837696, "lang": "ja", "rt": 82, "user": "yuttari1998"},
+  {"id": 505874920140591104, "lang": "ja", "rt": 0 , "user": "ttm_protect"},
+  {"id": 505874919020699648, "lang": "ja", "rt": 58, "user": "chibu4267"  }
+]
+```
+
+`--width n` sets the line length (120 by default) and `--indent n` the
+indentation (2). It works with `-r`, `-S` and `-a`, not with `-c` or
+`--tab`, and without colors.
 
 ## Performance {#performance}
 

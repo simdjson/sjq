@@ -30,6 +30,8 @@ struct writer {
   bool to_memory{false};
   bool color{false};
   bool ascii{false};  // -a: non-ASCII characters as \uXXXX escapes
+  bool fractured{false};  // --fractured: FracturedJson layout (simdjson's)
+  size_t fractured_width{120};  // --width
   const std::string *colors{nullptr};  // C_COUNT escape sequences when color is on
 
   writer() { buf.reserve(1 << 20); }
@@ -45,6 +47,8 @@ struct writer {
     sort_keys = o.sort_keys;
     color = o.color;
     ascii = o.ascii;
+    fractured = o.fractured;
+    fractured_width = o.fractured_width;
     colors = o.colors;
   }
   void flush() {
@@ -382,11 +386,71 @@ struct writer {
   }
 };
 
+// One output value, in the chosen layout.
+inline void write_output(writer &w, const value &v);
+
 inline std::string to_json(const value &v) {
   writer w{writer::small_tag{}};
   w.pretty = false;
   w.write_value(v, 0);
   return std::move(w.buf);
+}
+
+// The FracturedJson layout of simdjson: short arrays and objects on one
+// line, arrays of similar records as aligned tables. It formats DOM
+// elements: a value computed by the filter is serialized and parsed again
+// (with a parser per thread).
+inline void write_fractured(writer &w, const value &v) {
+  fractured_json_options opts;
+  opts.max_total_line_length = w.fractured_width;
+  opts.indent_spaces = size_t(w.indent);
+  std::string text;
+  if (v.dom && !w.sort_keys) {
+    text = fractured_json(v.e, opts);
+  } else {
+    writer compact{writer::small_tag{}};
+    compact.pretty = false;
+    compact.sort_keys = w.sort_keys;
+    compact.write_value(v, 0);
+    thread_local dom::parser parser;
+    padded_string copy(compact.buf);
+    dom::element el;
+    if (parser.parse(copy).get(el)) {
+      // Not expected (sjq writes valid JSON): fall back to the compact text.
+      text = std::move(compact.buf);
+    } else {
+      text = fractured_json(el, opts);
+    }
+  }
+  if (!w.ascii) {
+    w.put(text);
+    return;
+  }
+  // -a: non-ASCII characters only occur inside strings, so they can be
+  // escaped in the formatted text.
+  for (size_t i = 0; i < text.size();) {
+    uint8_t c = uint8_t(text[i]);
+    if (c < 0x80) {
+      w.put(char(c));
+      i++;
+      continue;
+    }
+    int len = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2);
+    uint32_t cp = c & (len == 4 ? 0x07 : (len == 3 ? 0x0F : 0x1F));
+    for (int k = 1; k < len && i + size_t(k) < text.size(); k++) { cp = (cp << 6) | (uint8_t(text[i + size_t(k)]) & 0x3F); }
+    i += size_t(len);
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      w.put_u16_escape(0xD800 + (cp >> 10));
+      w.put_u16_escape(0xDC00 + (cp & 0x3FF));
+    } else {
+      w.put_u16_escape(cp);
+    }
+  }
+}
+
+inline void write_output(writer &w, const value &v) {
+  if (w.fractured) { write_fractured(w, v); } else { w.write_value(v, 0); }
 }
 
 } // namespace sjq
