@@ -128,7 +128,10 @@ def table(rows, machine):
     for r in rows:
         # The options and the filter, without the program, the file and the
         # redirection.
-        words = shlex.split(r["times"]["sjq"][2].rsplit(" > ", 1)[0])[1:-1]
+        words = shlex.split(r["times"]["sjq"][2].rsplit(" > ", 1)[0])
+        # Skip a prefix such as taskset, then the program; drop the file.
+        start = next(k for k, w in enumerate(words) if w.endswith("sjq")) + 1
+        words = words[start:-1]
         args = " ".join(w if w.startswith("-") else "'" + w + "'" for w in words).replace("|", "\\|")
         j, s1, s = (r["times"][k][0] for k in ("jq", "sjq1", "sjq"))
         lines.append(f"| {r['data']} | {r['label']} | `{args}` | {fmt_s(j)} | {fmt_s(s1)} | {fmt_s(s)} | {j / s:.0f}x |")

@@ -166,7 +166,9 @@ tweet per line) and one 840 MB document. Each bar is the mean wall time of
 hyperfine runs (3 for jq, 10 for sjq), with the output written to
 `/dev/null`; the outputs of jq and sjq were checked to be identical. "sjq" is
 the default (all cores on large newline-delimited files);
-"sjq --threads 1" is sequential.
+"sjq --threads 1" is sequential. The machine has two sockets, and the time of
+a run on one core depends on the socket it lands on (up to 25%): the
+single-document runs of all three tools are pinned to the same socket.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench-ndjson-dark.svg">

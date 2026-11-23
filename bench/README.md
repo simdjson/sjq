@@ -1,7 +1,7 @@
 # Benchmarks
 
     python3 bench/make_data.py DATA --mb 1024      # tweets.ndjson, timeline.json
-    bench/run_bench.sh DATA RESULTS /path/to/jq build/sjq /path/to/hyperfine
+    PIN_DOCUMENT="taskset -c 1-127:2" bench/run_bench.sh DATA RESULTS /path/to/jq build/sjq /path/to/hyperfine
     python3 bench/plot.py RESULTS docs --machine "..."
 
 `probe.sh` runs each workload once and checks that jq and sjq print the same
@@ -12,3 +12,8 @@ documentation.
 The published numbers were measured on a dual Intel Xeon Gold 6548N (64
 cores, Linux, GCC 16.2), with jq 1.8.2's official static binary and
 hyperfine 2.0.
+
+On a machine with several sockets, a run on one core is up to 25% faster on
+the socket whose memory holds the file: `PIN_DOCUMENT` pins the
+single-document workloads of all three tools to one socket (here, the odd
+CPUs). `ONLY="07 08 09"` reruns some workloads and keeps the other results.
