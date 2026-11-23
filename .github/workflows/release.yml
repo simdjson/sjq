@@ -102,7 +102,12 @@ jobs:
   publish:
     name: publish
     needs: [linux, macos, windows]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # GitHub sometimes has no macOS runner for an hour and cancels the job:
+    # the release goes out without the macOS binary, which can then be built
+    # on a Mac and attached with scripts/release-macos.sh.
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.linux.result == 'success' && needs.windows.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write

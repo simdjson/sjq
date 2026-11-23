@@ -85,6 +85,11 @@ are listed in the [documentation](https://simdjson.github.io/sjq/#language).
 - Benchmarks: `bench/`.
 - Design notes: `doc/design.md`.
 
+- Releases: push a tag such as `v0.1.0`; the release workflow builds and
+  publishes the binaries and `SHA256SUMS`. If GitHub had no macOS runner,
+  the release goes out without the macOS binary: run
+  `scripts/release-macos.sh v0.1.0` on a Mac to build and attach it.
+
 sjq was first developed in the simdjson repository (simdjson/simdjson#3143).
 
 ## License
