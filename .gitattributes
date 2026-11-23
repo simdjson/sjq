@@ -1,0 +1,5 @@
+* text=auto
+# Expected outputs are compared byte for byte: keep LF line endings on Windows.
+tests/**/*.test -text
+tests/**/*.ndjson -text
+tests/data/*.json -text

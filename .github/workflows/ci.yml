@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a pull request cancels its previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: ubuntu-gcc, os: ubuntu-24.04, cc: gcc, cxx: g++, type: Release, flags: ""}
+          - {name: ubuntu-clang, os: ubuntu-24.04, cc: clang, cxx: clang++, type: Release, flags: ""}
+          - {name: ubuntu-sanitize, os: ubuntu-24.04, cc: gcc, cxx: g++, type: Debug, flags: "-DSJQ_SANITIZE=ON"}
+          - {name: ubuntu-arm64, os: ubuntu-24.04-arm, cc: gcc, cxx: g++, type: Release, flags: ""}
+          - {name: macos, os: macos-15, cc: clang, cxx: clang++, type: Release, flags: ""}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        run: >
+          CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DSJQ_WERROR=ON ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows-vs:
+    name: windows-vs
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        run: cmake -A x64 -DSJQ_WERROR=ON -B build
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  windows-mingw:
+    name: windows-mingw64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MINGW64
+          install: mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-gcc mingw-w64-x86_64-python
+      - name: Build and test
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSJQ_WERROR=ON
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build the fuzzer
+        run: >
+          CC=clang CXX=clang++
+          CXXFLAGS="-fsanitize=fuzzer-no-link,address,undefined"
+          LDFLAGS="-fsanitize=address,undefined"
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSJQ_FUZZING=ON &&
+          cmake --build build --target fuzz_sjq
+      - name: Fuzz for three minutes
+        run: |
+          python3 tests/fuzz_seeds.py corpus
+          UBSAN_OPTIONS=halt_on_error=1 build/fuzz_sjq corpus -dict=tests/fuzz.dict -max_total_time=180 -timeout=10 -rss_limit_mb=2048 -artifact_prefix=./
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            crash-*
+            timeout-*
+            oom-*
