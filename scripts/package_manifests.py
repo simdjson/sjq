@@ -45,6 +45,22 @@ def main():
     sums = checksums(tag)
     base = f"https://github.com/{REPO}/releases/download/{tag}"
 
+    # A release can lack the macOS binary for a while (scripts/release-macos.sh
+    # attaches it). No package manager is updated before the release is
+    # complete: until then, nothing is written.
+    needed = ["sjq-macos-universal.tar.gz", "sjq-linux-x86_64.tar.gz", "sjq-linux-aarch64.tar.gz",
+              "sjq-windows-x86_64.zip", "sjq-windows-arm64.zip"]
+    missing = [n for n in needed if n not in sums]
+    if missing:
+        print(f"{tag} is not complete (missing: {', '.join(missing)}): no manifest written")
+        return
+    write_homebrew(out, base, sums)
+    write_scoop(out, base, sums, version)
+    write_winget(out, base, sums, version, tag)
+    print(f"wrote the manifests of {tag} in {os.path.abspath(out)}")
+
+
+def write_homebrew(out, base, sums):
     os.makedirs(os.path.join(out, "homebrew"), exist_ok=True)
     with open(os.path.join(out, "homebrew", "sjq.rb"), "w") as f:
         f.write(f'''class Sjq < Formula
@@ -85,6 +101,9 @@ def main():
 end
 ''')
 
+
+
+def write_scoop(out, base, sums, version):
     os.makedirs(os.path.join(out, "scoop"), exist_ok=True)
     with open(os.path.join(out, "scoop", "sjq.json"), "w") as f:
         f.write(f'''{{
@@ -114,6 +133,9 @@ end
 }}
 ''')
 
+
+
+def write_winget(out, base, sums, version, tag):
     wid = "simdjson.sjq"
     os.makedirs(os.path.join(out, "winget"), exist_ok=True)
     header = f'''PackageIdentifier: {wid}
@@ -166,7 +188,6 @@ ReleaseNotesUrl: https://github.com/{REPO}/releases/tag/{tag}
 ManifestType: defaultLocale
 ManifestVersion: 1.28.0
 ''')
-    print(f"wrote the manifests of {tag} in {os.path.abspath(out)}")
 
 
 if __name__ == "__main__":

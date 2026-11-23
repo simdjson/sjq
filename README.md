@@ -120,9 +120,12 @@ are listed in the [documentation](https://simdjson.github.io/sjq/#language).
   publishes the binaries and `SHA256SUMS`. If GitHub had no macOS runner,
   the release goes out without the macOS binary: run
   `scripts/release-macos.sh v0.1.0` on a Mac to build and attach it.
-  Then `scripts/update_packages.sh v0.1.0` updates the Scoop manifest
-  (`bucket/`) and the Homebrew tap (simdjson/homebrew-tap), and writes the
-  winget manifests for a pull request to microsoft/winget-pkgs.
+  The package managers follow the latest release once it is complete
+  (all five binaries): the `Packages` workflow updates the Scoop manifest
+  (`bucket/sjq.json`) and keeps the winget manifests as an artifact, and
+  simdjson/homebrew-tap updates its formula. Both run after each release
+  workflow and every six hours; `scripts/update_packages.sh` (called by
+  `release-macos.sh`) runs them right away.
 
 sjq was first developed in the simdjson repository (simdjson/simdjson#3143).
 
