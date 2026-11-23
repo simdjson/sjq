@@ -33,9 +33,12 @@ try {
   Remove-Item -Recurse -Force $tmp
 }
 
+# The user Path is null on a profile that never set one.
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not $userPath) { $userPath = '' }
 if (-not (($userPath -split ';') -contains $dir)) {
-  [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ";$dir"), 'User')
+  $newPath = if ($userPath) { $userPath.TrimEnd(';') + ";$dir" } else { $dir }
+  [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
   Write-Host "Added $dir to your user PATH (open a new terminal to use it)."
 }
 & (Join-Path $dir 'sjq.exe') --version

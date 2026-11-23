@@ -235,6 +235,13 @@ def targeted(sjq, data, tmp):
     check("exit: syntax error", code == 3, f"exit {code} {err[:200]!r}")
     check("exit: --indent 8", run([sjq, "--indent", "8", "."], b"1")[0] == 2)
     check("exit: missing file", run([sjq, ".", os.path.join(tmp, "nope.json")])[0] == 2)
+    ok_path = os.path.join(tmp, "ok.json")
+    with open(ok_path, "wb") as f:
+        f.write(b"{}")
+    code, out, _ = run([sjq, ".", os.path.join(tmp, "nope.json"), ok_path])
+    check("exit: missing file then a good one", code == 2 and out == b"{}\n", f"exit {code} {out!r}")
+    code, _, _ = run([sjq, "-s", ".", os.path.join(tmp, "nope.json"), ok_path])
+    check("exit: missing file with -s", code == 2, f"exit {code}")
     check("exit: runtime error of the last input", run([sjq, ".a"], b"[]")[0] == 5)
     check("exit: error then success", run([sjq, ".a"], b'[] {"a":1}')[0] == 0)
     check("exit: -b accepted", run([sjq, "-b", "-c", "."], b"[1]")[1] == b"[1]\n")
@@ -282,6 +289,11 @@ def targeted(sjq, data, tmp):
     ):
         code, out, _ = run(argv, stdin)
         check(f"ndjson {label}", code == 0 and out == want, f"exit {code}, {len(out)} bytes")
+    # --raw-output0 on the parallel path and sequentially.
+    want0 = "".join(str(d["i"]) + "\0" for d in docs).encode()
+    for label, extra in (("parallel", []), ("sequential", ["--threads", "1"])):
+        code, out, _ = run([sjq] + extra + ["--raw-output0", ".i | tostring", nd_path])
+        check(f"--raw-output0 {label}", code == 0 and out == want0, f"exit {code}, {out.count(b'\0')} NULs, {out.count(b'\n')} newlines")
     with open(nd_path, "rb") as f:
         p = subprocess.run([sjq, "-c", ".o"], stdin=f, stdout=subprocess.PIPE, timeout=TIMEOUT)
     check("ndjson redirected stdin", p.returncode == 0 and norm(p.stdout) == want)

@@ -328,6 +328,9 @@ int main(int argc, char **argv) {
   if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: %s path\n", plan ? "On-Demand" : "DOM"); }
 
   int status = 0;
+  // As jq: an input that cannot be opened, read or parsed makes the exit
+  // status 2, whatever happens with the other inputs.
+  bool file_error = false;
   int last_output = -1;  // -e: -1 no output, 0 false or null, 1 other
   auto emit = [&](const value &v) {
     if (seq) { w.put('\x1e'); }
@@ -339,6 +342,7 @@ int main(int argc, char **argv) {
     w.maybe_flush();
   };
   auto final_status = [&](int st) {
+    if (file_error) { return 2; }
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
   };
@@ -406,7 +410,7 @@ int main(int argc, char **argv) {
         std::string text;
         if (!read_file(fname, text)) {
           fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
-          status = 2;
+          file_error = true;
           continue;
         }
         pending.clear();
@@ -424,7 +428,7 @@ int main(int argc, char **argv) {
           if (!parse_all(text, pending, err)) {
             w.flush();
             fprintf(stderr, "sjq: error (at %s): %s\n", fname == "-" ? "<stdin>" : fname.c_str(), err.c_str());
-            status = 2;
+            file_error = true;
             failed = true;
           }
         }
@@ -445,7 +449,7 @@ int main(int argc, char **argv) {
             std::string text;
             if (!read_file(fname, text)) {
               fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
-              status = 2;
+              file_error = true;
               continue;
             }
             all += text;
@@ -530,7 +534,7 @@ int main(int argc, char **argv) {
         ondemand::document_stream stream;
         if (od_parser.iterate_many(sbuf, slen, batch, fmt).get(stream)) {
           fprintf(stderr, "sjq: error: cannot parse %s\n", name);
-          status = 2;
+          file_error = true;
           fatal = true;
           return len;
         }
@@ -566,7 +570,7 @@ int main(int argc, char **argv) {
         dom::document_stream stream;
         if (parser.parse_many(sbuf, slen, batch, fmt).get(stream)) {
           fprintf(stderr, "sjq: error: cannot parse %s\n", name);
-          status = 2;
+          file_error = true;
           fatal = true;
           return len;
         }
@@ -647,7 +651,8 @@ int main(int argc, char **argv) {
         if (seq) { lw.put('\x1e'); }
         if (raw && v.k == K::Str) { lw.put(get_str(v)); }
         else { lw.write_value(v, 0); }
-        if (!join) { lw.put('\n'); }
+        if (raw0) { lw.put('\0'); }
+        else if (!join) { lw.put('\n'); }
       };
       while (true) {
         size_t k = next.fetch_add(1);
@@ -758,7 +763,7 @@ int main(int argc, char **argv) {
     if (input.changed()) {
       w.flush();
       fprintf(stderr, "sjq: error: %s changed while being read; the output is incomplete\n", name);
-      status = 2;
+      file_error = true;
     }
     current = nullptr;
   };
@@ -783,7 +788,7 @@ int main(int argc, char **argv) {
         if (r < 0) {
           w.flush();
           fprintf(stderr, "sjq: error: cannot read %s\n", name);
-          status = 2;
+          file_error = true;
           fatal = true;
           break;
         }
@@ -839,7 +844,7 @@ int main(int argc, char **argv) {
     input_source input;
     if (!input.load(fname, use_mmap)) {
       fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
-      status = 2;
+      file_error = true;
       continue;
     }
     run_input(input, fname.c_str());
