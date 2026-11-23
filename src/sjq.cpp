@@ -7,12 +7,13 @@
 #include "writer.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,7 +42,8 @@ static void usage(FILE *f) {
           "      --tab                 indent with tabs\n"
           "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
           "  -f, --from-file file      read the filter from a file\n"
-          "  -o, --output file         write the output to a file (UTF-8, LF line ends)\n"
+          "  -o, --output file         write the output to a file (UTF-8, LF line ends), replaced\n"
+          "                            at the end of a successful run (it can be an input)\n"
           "      --arg name value      set $name to the string value\n"
           "      --argjson name json   set $name to the JSON value\n"
           "      --slurpfile name file set $name to an array of the JSON values in file\n"
@@ -62,6 +64,10 @@ static void usage(FILE *f) {
           "On Windows, quoting a filter is hard in cmd and PowerShell 5: put it in a file and use -f FILE.\n"
           "Documentation: https://simdjson.github.io/sjq/\n");
 }
+
+static const char *const UTF16_ADVICE =
+    "the file seems to be in UTF-16 without a byte order mark (Windows PowerShell 5 writes UTF-16 with >): "
+    "save it as UTF-8, or write it with sjq -o FILE";
 
 // Reads a whole file (or standard input for "-"); false when it cannot, with
 // the reason in why. UTF-16 with a byte order mark is converted to UTF-8.
@@ -87,13 +93,15 @@ static bool read_file(const std::string &name, std::string &out, std::string &wh
     out.assign(src.data(), src.size());
   }
   std::string converted;
-  if (utf16_with_bom_to_utf8(out.data(), out.size(), converted)) { out.swap(converted); }
+  if (utf16_with_bom_to_utf8(out.data(), out.size(), converted)) {
+    out.swap(converted);
+  } else if (looks_like_utf16(out.data(), out.size())) {
+    why = UTF16_ADVICE;
+    return false;
+  }
   return true;
 }
 
-static const char *const UTF16_ADVICE =
-    "the file seems to be in UTF-16 without a byte order mark (Windows PowerShell 5 writes UTF-16 with >): "
-    "save it as UTF-8, or write it with sjq -o FILE";
 
 // Parses every JSON value of text as owned values; false on a parse error.
 static bool parse_all(const std::string &text, std::vector<value> &out, std::string &err) {
@@ -258,7 +266,7 @@ int main(int argc, char **argv) {
       need(i, 2, a);
       std::string text, why;
       if (!read_file(argv[i + 2], text, why)) {
-        fprintf(stderr, "sjq: error: could not open %s: %s\n", argv[i + 2], why.c_str());
+        fprintf(stderr, "sjq: error: could not read %s: %s\n", argv[i + 2], why.c_str());
         return 2;
       }
       if (a == "--rawfile") {
@@ -332,7 +340,7 @@ int main(int argc, char **argv) {
   if (!filter_file.empty()) {
     std::string why;
     if (!read_file(filter_file, filter, why)) {
-      fprintf(stderr, "sjq: error: could not open %s: %s\n", filter_file.c_str(), why.c_str());
+      fprintf(stderr, "sjq: error: could not read %s: %s\n", filter_file.c_str(), why.c_str());
       return 2;
     }
     // Some Windows editors, and PowerShell 5's Out-File -Encoding utf8, start
@@ -348,19 +356,10 @@ int main(int argc, char **argv) {
 
   static std::string colors[C_COUNT];
   const char *no_color = getenv("NO_COLOR");
-  // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
-  // that the shell does not re-encode the output (Windows PowerShell 5's >
-  // writes UTF-16).
+  // -o FILE: opened once the filter compiles (see below).
   FILE *output = nullptr;
-  if (!output_file.empty()) {
-    output = fopen(output_file.c_str(), "wb");
-    if (!output) {
-      fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), strerror(errno));
-      return 2;
-    }
-    w.out = output;
-  }
-  const bool terminal = !output && stdout_is_terminal();
+  std::string output_tmp{};
+  const bool terminal = output_file.empty() && stdout_is_terminal();
   const bool can_color = prepare_console(binary);
   // The FracturedJson layout has no colors.
   w.color = !w.fractured && (color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color)));
@@ -376,6 +375,22 @@ int main(int argc, char **argv) {
   compile_info info{};
   node_ptr prog = compile_or_report(filter, globals, info);
   if (!prog) { return 3; }
+
+  // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
+  // that the shell does not re-encode the output (Windows PowerShell 5's >
+  // writes UTF-16). It writes a temporary file next to it, which replaces
+  // FILE at the end of a successful run: FILE can also be an input
+  // (sjq -o data.json ... data.json), and a failed run leaves it as it was.
+  if (!output_file.empty()) {
+    output_tmp = output_file + ".sjq-" + std::to_string(unsigned(time(nullptr))) + "-" +
+                 std::to_string(reinterpret_cast<uintptr_t>(&output_tmp) & 0xFFFFF) + ".tmp";
+    output = fopen(output_tmp.c_str(), "wb");
+    if (!output) {
+      fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), strerror(errno));
+      return 2;
+    }
+    w.out = output;
+  }
   // The variables of --arg and friends, and $ARGS.
   env_ptr root_env{};
   root_env = push_var("ARGS", value::object({{"positional", value::array(positional)}, {"named", value::object(named)}}), root_env);
@@ -407,14 +422,31 @@ int main(int argc, char **argv) {
     if (file_error) { return 2; }
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
-  };  // Writes what is left and checks that the output file was written.
+  };
+  // -o: puts the temporary file in place (keep) or removes it. Returns false
+  // when the file could not be written.
+  auto close_output = [&](bool keep) {
+    if (!output) { return true; }
+    bool ok = !ferror(output);
+    ok = fclose(output) == 0 && ok;
+    output = nullptr;
+    if (ok && keep && replace_file(output_tmp, output_file)) { return true; }
+    std::remove(output_tmp.c_str());
+    if (!ok || keep) {
+      fprintf(stderr, "sjq: error: could not write %s\n", output_file.c_str());
+      return false;
+    }
+    fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file.c_str());
+    return true;
+  };
+  // Writes what is left and checks that the output file was written.
   auto finish = [&](int st) {
     w.flush();
-    if (output && (ferror(output) || fclose(output) != 0)) {
-      fprintf(stderr, "sjq: error: could not write %s\n", output_file.c_str());
-      return 2;
-    }
-    return final_status(st);
+    int fs = final_status(st);
+    // With -e, 1 and 4 describe the output: the run itself succeeded.
+    bool success = fs == 0 || (exit_status && (fs == 1 || fs == 4));
+    if (!close_output(success)) { return 2; }
+    return fs;
   };
 
   // jq reports the number of lines consumed when an error happens. line_count
@@ -450,7 +482,9 @@ int main(int argc, char **argv) {
       w.flush();
       fputs(h.message.c_str(), stderr);
       fflush(stderr);
-      exit(h.code);
+      // halt and halt_error end the program as asked: the output so far is
+      // kept.
+      exit(close_output(true) ? h.code : 2);
     } catch (break_signal &) {
       w.flush();
       fprintf(stderr, "sjq: error (at %s): break\n", name);
@@ -480,7 +514,7 @@ int main(int argc, char **argv) {
         g_input_filename = fname == "-" ? nullptr : fname.c_str();
         std::string text, why;
         if (!read_file(fname, text, why)) {
-          fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), why.c_str());
+          fprintf(stderr, "sjq: error: could not read %s: %s\n", fname == "-" ? "<stdin>" : fname.c_str(), why.c_str());
           file_error = true;
           continue;
         }
@@ -519,7 +553,7 @@ int main(int argc, char **argv) {
           for (const auto &fname : files) {
             std::string text, why;
             if (!read_file(fname, text, why)) {
-              fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), why.c_str());
+              fprintf(stderr, "sjq: error: could not read %s: %s\n", fname == "-" ? "<stdin>" : fname.c_str(), why.c_str());
               file_error = true;
               continue;
             }
@@ -923,10 +957,27 @@ int main(int argc, char **argv) {
       if (!fmt_known && cut > 0) {
         fmt = input_format(buf.data(), cut);
         fmt_known = true;
-        bool bom16 = cut >= 2 && ((static_cast<unsigned char>(buf[0]) == 0xFF && static_cast<unsigned char>(buf[1]) == 0xFE) ||
-                                  (static_cast<unsigned char>(buf[0]) == 0xFE && static_cast<unsigned char>(buf[1]) == 0xFF));
-        if (bom16 || looks_like_utf16(buf.data(), cut)) {
-          fprintf(stderr, "sjq: error (at %s): the input is in UTF-16: save it as UTF-8, or pass the file name to sjq\n", name);
+        bool bom16 = filled >= 2 && ((static_cast<unsigned char>(buf[0]) == 0xFF && static_cast<unsigned char>(buf[1]) == 0xFE) ||
+                                     (static_cast<unsigned char>(buf[0]) == 0xFE && static_cast<unsigned char>(buf[1]) == 0xFF));
+        if (bom16) {
+          // UTF-16 with a byte order mark (cmd's type command sends it): the
+          // whole input is read and converted, then filtered.
+          std::string all(buf.data(), filled);
+          char more[65536];
+          while (!eof) {
+            long long r = read_stdin(more, sizeof(more));
+            if (r <= 0) { break; }
+            all.append(more, size_t(r));
+          }
+          std::string converted;
+          utf16_with_bom_to_utf8(all.data(), all.size(), converted);
+          input_source converted_input;
+          converted_input.adopt(converted);
+          run_input(converted_input, name);
+          break;
+        }
+        if (looks_like_utf16(buf.data(), cut)) {
+          fprintf(stderr, "sjq: error (at %s): %s\n", name, UTF16_ADVICE);
           file_error = true;
           break;
         }

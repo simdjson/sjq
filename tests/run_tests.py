@@ -295,6 +295,53 @@ def targeted(sjq, data, tmp):
         written = f.read()
     check("-o FILE", code == 0 and out == b"" and written == '"\u00e9"\n'.encode(), f"exit {code} {written!r} {err!r}")
 
+    # -o: the file is replaced only after a successful run.
+    dpath = os.path.join(tmp, "same.json")
+    with open(dpath, "wb") as f:
+        f.write(b'{"b": {"c": 1}, "z": 2}')
+    code, out, err = run([sjq, "-c", "-o", dpath, ".b", dpath])
+    with open(dpath, "rb") as f:
+        written = f.read()
+    check("-o onto the input file", code == 0 and written == b'{"c":1}\n', f"exit {code} {written!r} {err!r}")
+    for label, argv in (("filter error", [".a | lenght", dpath]), ("missing input", [".", os.path.join(tmp, "nope.json")]),
+                        ("runtime error", ["error(\"x\")", dpath])):
+        code, _, err = run([sjq, "-o", dpath] + argv)
+        with open(dpath, "rb") as f:
+            kept = f.read()
+        check(f"-o keeps the file after a {label}", code != 0 and kept == b'{"c":1}\n', f"exit {code} {kept!r} {err!r}")
+    leftovers = [n for n in os.listdir(tmp) if ".sjq-" in n]
+    check("-o leaves no temporary file", not leftovers, repr(leftovers))
+
+    # Errors in strings of filters point at the escape, or at the end.
+    code, _, err = run([sjq, "-n", '"abc\\q"'])
+    check("filter error escape position", code == 3 and b"column 5" in err, repr(err))
+    code, _, err = run([sjq, "-n", '"abc'])
+    check("filter error unterminated string", code == 3 and b"unterminated string at line 1, column 5" in err, repr(err))
+    code, out, _ = run([sjq, "-n", '"  {,}", "1 2" | try fromjson catch .'])
+    check("fromjson error positions", code == 0 and b"column 4: expected a string" in out and b"unexpected content after the JSON value" in out,
+          repr(out))
+
+    # UTF-16 through a pipe (cmd's type), with -R.
+    with open(u16, "wb") as f:
+        f.write('{"a": "\u00e9"}'.encode("utf-16"))
+    with open(u16, "rb") as f:
+        p = subprocess.run([sjq, "-r", ".a"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=f.read(), timeout=TIMEOUT)
+    check("UTF-16 through a pipe", p.returncode == 0 and norm(p.stdout) == "\u00e9\n".encode(), f"exit {p.returncode} {p.stdout!r} {p.stderr!r}")
+    with open(u16, "wb") as f:
+        f.write("line\n".encode("utf-16-le"))
+    code, _, err = run([sjq, "-R", ".", u16])
+    check("UTF-16 with -R", code == 2 and b"UTF-16" in err, f"exit {code} {err!r}")
+
+    # A stream given by name (process substitution, a FIFO).
+    if sys.platform != "win32" and hasattr(os, "mkfifo"):
+        fifo = os.path.join(tmp, "fifo")
+        os.mkfifo(fifo)
+        writer = threading.Thread(target=lambda: open(fifo, "wb").write(b'{"k": 5}'))
+        writer.start()
+        code, out, err = run([sjq, ".k", fifo])
+        writer.join(10)
+        check("FIFO given by name", code == 0 and out == b"5\n", f"exit {code} {out!r} {err!r}")
+
     # --fractured (simdjson's FracturedJson layout).
     rows = b'[{"id":1,"name":"a","n":10},{"id":22,"name":"bbb","n":3}]'
     code, out, err = run([sjq, "--fractured", "--width", "40", "."], rows)
@@ -374,6 +421,12 @@ def targeted(sjq, data, tmp):
     code2, out2, _ = run([sjq, "--threads", "1", "--fractured", "{i, a, o}", nd_path])
     check("--fractured parallel and sequential", code1 == 0 and code2 == 0 and out1 == out2 and out1.startswith(b'{ "i": 0, "a": [0, 0], "o": {"k": "0"} }\n'),
           f"exit {code1} {code2} {out1[:80]!r} {out2[:80]!r}")
+
+    opath2 = os.path.join(tmp, "parallel-out.json")
+    code, _, err = run([sjq, "-c", "-o", opath2, ".o", nd_path])
+    with open(opath2, "rb") as f:
+        written = f.read()
+    check("-o on the parallel path", code == 0 and written == want, f"exit {code}, {len(written)} bytes {err!r}")
 
     # Only newline-delimited input goes to the worker threads: one large
     # pretty-printed document, or pretty-printed documents, stay sequential.

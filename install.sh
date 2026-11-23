@@ -82,7 +82,7 @@ case "${SHELL:-}" in
     # macOS Terminal opens login shells, which read ~/.bash_profile.
     if [ "$(uname -s)" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
     line="export PATH=\"$shown_dir:\$PATH\"" ;;
-  */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path $shown_dir" ;;
+  */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path \"$shown_dir\"" ;;
   *) rc="$HOME/.profile"; line="export PATH=\"$shown_dir:\$PATH\"" ;;
 esac
 case "$rc" in
@@ -91,8 +91,12 @@ case "$rc" in
 esac
 if [ "${SJQ_MODIFY_PATH:-}" = 1 ]; then
   mkdir -p "$(dirname "$rc")"
-  printf '\n%s\n' "$line" >> "$rc"
-  echo "Added to $shown_rc: $line"
+  if [ -f "$rc" ] && grep -qxF "$line" "$rc"; then
+    echo "$shown_rc already has: $line"
+  else
+    printf '\n%s\n' "$line" >> "$rc"
+    echo "Added to $shown_rc: $line"
+  fi
   echo "Open a new terminal, or run: $line"
 else
   echo "$dir is not in your PATH. To add it, run:"

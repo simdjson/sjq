@@ -126,6 +126,13 @@ jobs:
         run: |
           SJQ_INSTALL_DIR="$RUNNER_TEMP/sjq" sh install.sh
           "$RUNNER_TEMP/sjq/sjq" --version
+      - name: install.sh with SJQ_MODIFY_PATH=1, twice
+        run: |
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$home"
+          HOME="$home" SHELL=/bin/bash SJQ_MODIFY_PATH=1 sh install.sh
+          HOME="$home" SHELL=/bin/bash SJQ_MODIFY_PATH=1 sh install.sh
+          test "$(grep -c '.local/bin' "$home/.bashrc")" = 1
   install-scoop:
     name: install-scoop
     runs-on: windows-latest

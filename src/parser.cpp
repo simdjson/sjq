@@ -46,13 +46,14 @@ struct lexer {
     if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
     return -1;
   }
-  // The four hex digits of a \u escape at src[at].
+  // The four hex digits of a \u escape at src[at]; errors point at the
+  // backslash (at - 2).
   unsigned hex4(size_t at) {
-    if (at + 4 > src.size()) { fail("invalid \\uXXXX escape"); }
+    if (at + 4 > src.size()) { fail_at("invalid \\uXXXX escape (it needs four hexadecimal digits)", at - 2); }
     unsigned cp = 0;
     for (size_t k = at; k < at + 4; k++) {
       int d = hex_digit(src[k]);
-      if (d < 0) { fail("invalid \\uXXXX escape"); }
+      if (d < 0) { fail_at("invalid \\uXXXX escape (it needs four hexadecimal digits)", at - 2); }
       cp = cp * 16 + unsigned(d);
     }
     return cp;
@@ -80,7 +81,7 @@ struct lexer {
       }
       at++;
     }
-    if (at >= src.size()) { fail("unterminated string"); }
+    if (at >= src.size()) { fail_at("unterminated string", src.size()); }
     return at + 1;
   }
   // Finds the ')' that closes an interpolation; at points after "\(".
@@ -117,7 +118,8 @@ struct lexer {
         r.push_back(c);
         continue;
       }
-      if (i >= src.size()) { fail("unterminated string"); }
+      size_t esc = i - 1;  // the backslash, for errors
+      if (i >= src.size()) { fail_at("unterminated string", src.size()); }
       char d = src[i++];
       switch (d) {
       case 'n': r.push_back('\n'); break;
@@ -131,11 +133,11 @@ struct lexer {
       case 'u': {
         unsigned cp = hex4(i);
         i += 4;
-        if (cp >= 0xDC00 && cp < 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+        if (cp >= 0xDC00 && cp < 0xE000) { fail_at("invalid \\uXXXX\\uXXXX surrogate pair escape", esc); }
         if (cp >= 0xD800 && cp < 0xDC00) {
-          if (i + 2 > src.size() || src[i] != '\\' || src[i + 1] != 'u') { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+          if (i + 2 > src.size() || src[i] != '\\' || src[i + 1] != 'u') { fail_at("invalid \\uXXXX\\uXXXX surrogate pair escape", esc); }
           unsigned lo = hex4(i + 2);
-          if (lo < 0xDC00 || lo >= 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+          if (lo < 0xDC00 || lo >= 0xE000) { fail_at("invalid \\uXXXX\\uXXXX surrogate pair escape", esc); }
           i += 6;
           cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
         }
@@ -154,10 +156,10 @@ struct lexer {
         i = close + 1;
         break;
       }
-      default: fail(std::string("bad escape \\") + d);
+      default: fail_at(std::string("bad escape \\") + d, esc);
       }
     }
-    if (i >= src.size()) { fail("unterminated string"); }
+    if (i >= src.size()) { fail_at("unterminated string", src.size()); }
     i++;
     return parts;
   }

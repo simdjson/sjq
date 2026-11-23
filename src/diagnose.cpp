@@ -1,6 +1,7 @@
 #include "diagnose.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +131,7 @@ struct checker {
       while (i < n && isdigit((unsigned char)s[i])) { i++; }
     }
     if (i < n && !delimiter(s[i]) && s[i] != '"' && s[i] != '[' && s[i] != '{') { return fail(start, "invalid number"); }
+    if (std::isinf(strtod(std::string(s + start, i - start).c_str(), nullptr))) { return fail(start, "number out of range"); }
     return true;
   }
 
@@ -162,7 +164,6 @@ struct checker {
         }
         char c = s[i];
         if (c == '{' || c == '[') {
-          if (stack.size() >= 1024) { return fail(i, "nested more than 1024 levels deep"); }
           stack.push_back({c, i, 0});
           i++;
           want_value = false;
@@ -230,22 +231,28 @@ struct checker {
     }
   }
 
-  void run() {
+  void run(bool single) {
     // A UTF-8 byte order mark at the start is accepted.
     if (n >= 3 && memcmp(s, "\xEF\xBB\xBF", 3) == 0) { i = 3; }
+    bool first = true;
     while (true) {
       skip_space();
       if (i >= n) { return; }
+      if (single && !first) {
+        fail(i, "unexpected content after the JSON value");
+        return;
+      }
       if (!value()) { return; }
+      first = false;
     }
   }
 };
 
 } // namespace
 
-json_problem find_json_problem(const char *data, size_t len) {
+json_problem find_json_problem(const char *data, size_t len, bool single) {
   checker c{data, len};
-  c.run();
+  c.run(single);
   return c.problem;
 }
 
@@ -283,8 +290,8 @@ std::string line_and_column(const char *text, size_t offset) {
   return "line " + std::to_string(line) + ", column " + std::to_string(col);
 }
 
-std::string describe_json_error(const char *text, size_t len, simdjson::error_code err) {
-  json_problem p = find_json_problem(text, len);
+std::string describe_json_error(const char *text, size_t len, simdjson::error_code err, bool single) {
+  json_problem p = find_json_problem(text, len, single);
   if (p.found) { return "invalid JSON at " + line_and_column(text, p.offset) + ": " + p.message; }
   return "invalid JSON: " + plain_error(err);
 }
@@ -319,6 +326,8 @@ bool utf16_with_bom_to_utf8(const char *text, size_t len, std::string &out) {
     }
     append_utf8(out, (u >= 0xD800 && u < 0xE000) ? 0xFFFD : u);
   }
+  // A last, lone byte is not a character.
+  if (len % 2) { append_utf8(out, 0xFFFD); }
   return true;
 }
 

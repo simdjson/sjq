@@ -1695,7 +1695,7 @@ static value from_json(std::string_view s) {
   padded_string copy(t);
   dom::element el;
   auto err = parser.parse(copy).get(el);
-  if (err) { throw jq_error(describe_json_error(t.data(), t.size(), err) + " (while parsing '" + std::string(s) + "')"); }
+  if (err) { throw jq_error(describe_json_error(s.data(), s.size(), err, true) + " (while parsing '" + std::string(s) + "')"); }
   return to_owned(el);
 }
 

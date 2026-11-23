@@ -114,7 +114,22 @@ bool input_source::load(const std::string &fname, bool use_mmap) {
 #else
   (void)use_mmap;
 #endif
-  if (simdjson::padded_string::load(fname).get(p_->owned)) { return false; }
+  if (is_regular_file(fname.c_str())) {
+    if (simdjson::padded_string::load(fname).get(p_->owned)) { return false; }
+  } else {
+    // A pipe or another stream given by name (sjq . <(curl ...)): read to the
+    // end, since it cannot be measured or mapped.
+    FILE *f = fopen(fname.c_str(), "rb");
+    if (!f) { return false; }
+    std::string text;
+    char buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) { text.append(buf, got); }
+    bool failed = ferror(f) != 0;
+    fclose(f);
+    if (failed) { return false; }
+    p_->owned = simdjson::padded_string(text);
+  }
   p_->p = p_->owned.data();
   p_->n = p_->owned.size();
   return true;
@@ -132,6 +147,16 @@ void input_source::adopt(const std::string &text) {
   p_->owned = simdjson::padded_string(text);
   p_->p = p_->owned.data();
   p_->n = p_->owned.size();
+}
+
+bool replace_file(const std::string &from, const std::string &to) {
+#if defined(_WIN32)
+  // The process code page is UTF-8 (see sjq.manifest): the A function takes
+  // any file name.
+  return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+  return rename(from.c_str(), to.c_str()) == 0;
+#endif
 }
 
 std::string open_failure_reason(const std::string &fname) {

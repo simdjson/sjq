@@ -38,6 +38,10 @@ private:
   std::unique_ptr<impl> p_;
 };
 
+// Puts the file from in place of the file to (replacing it, atomically on
+// POSIX); false when it cannot.
+bool replace_file(const std::string &from, const std::string &to);
+
 // Why a file cannot be read ("No such file or directory", ...).
 std::string open_failure_reason(const std::string &fname);
 
