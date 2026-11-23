@@ -157,8 +157,11 @@ the default (all cores on large newline-delimited files);
 {% include results.md %}
 
 These workloads show where sjq is strongest: large inputs, whose parsing
-dominates. Even sequential, sjq is ten to forty times faster than jq here.
-Filters that compute a lot on small inputs gain less. To reproduce the
+dominates. Even sequential, sjq is twelve to forty times faster than jq here;
+on large newline-delimited files, its worker threads add another factor of
+three to eight. Filters with regular expressions run on one thread. A single
+large document is parsed by one thread. Filters that compute a lot on small
+inputs gain less. To reproduce the
 numbers, see [`bench/`](https://github.com/simdjson/sjq/tree/main/bench).
 
 ## The filter language {#language}

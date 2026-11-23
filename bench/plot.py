@@ -55,9 +55,11 @@ def fmt_s(t):
 
 
 def nice_max(v):
-    for step in (1, 2, 2.5, 5, 10, 20, 25, 50, 100):
-        if v <= step * 5:
-            return step * 5, step
+    # The smallest round step that covers v in at most six ticks.
+    for step in (0.5, 1, 2, 5, 10, 20, 50, 100):
+        ticks = -(-v // step)
+        if ticks <= 6:
+            return step * ticks, step
     return v, v / 5
 
 
