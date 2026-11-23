@@ -56,6 +56,8 @@ target_link_libraries(sjq-core PUBLIC simdjson::simdjson Threads::Threads)
 add_library(sjq-warnings INTERFACE)
 if(MSVC)
   target_compile_options(sjq-warnings INTERFACE /W3 /sdl /permissive-)
+  # getenv and fopen are fine here; /sdl would make their deprecation an error.
+  target_compile_definitions(sjq-warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
   if(SJQ_WERROR)
     target_compile_options(sjq-warnings INTERFACE /WX)
   endif()
