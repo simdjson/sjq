@@ -1,5 +1,6 @@
 // sjq: a jq-compatible JSON processor built on simdjson.
 #include "ast.h"
+#include "builtins.h"
 #include "input.h"
 #include "ondemand.h"
 #include "writer.h"
@@ -20,22 +21,80 @@ using namespace sjq;
 static void usage(FILE *f) {
   fprintf(f,
           "usage: sjq [OPTIONS] FILTER [FILE...]\n"
-          "  -c, --compact-output   one line per output\n"
-          "  -r, --raw-output       write strings without quotes\n"
-          "  -j, --join-output      like -r, without newlines\n"
-          "  -n, --null-input       run the filter once on null\n"
-          "  -S, --sort-keys        sort object keys\n"
-          "  -C, --color-output     colorize output (default when stdout is a terminal)\n"
+          "       sjq [OPTIONS] -f FILTER_FILE [FILE...]\n"
+          "  -c, --compact-output      one line per output\n"
+          "  -r, --raw-output          write strings without quotes\n"
+          "  -j, --join-output         like -r, without newlines\n"
+          "      --raw-output0         like -r, with a NUL after each output\n"
+          "  -a, --ascii-output        escape non-ASCII characters\n"
+          "  -n, --null-input          run the filter once on null\n"
+          "  -s, --slurp               read all inputs into one array\n"
+          "  -R, --raw-input           read lines as strings (with -s: the whole input)\n"
+          "  -e, --exit-status         exit status from the last output\n"
+          "  -S, --sort-keys           sort object keys\n"
+          "  -C, --color-output        colorize output (default when stdout is a terminal)\n"
           "  -M, --monochrome-output\n"
-          "      --tab              indent with tabs\n"
-          "      --indent n         indent with n spaces (-1 to 7; -1 means tabs)\n"
-          "      --seq              write an RS before each output; read RS-separated input\n"
-          "      --unbuffered       flush after each input\n"
-          "  -b, --binary           on Windows, write LF line ends (no CR)\n"
-          "      --threads n        worker threads for large files (1: sequential)\n"
-          "      --no-od            do not use the On-Demand fast path\n"
-          "      --no-mmap          read files instead of mapping them\n"
+          "      --tab                 indent with tabs\n"
+          "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
+          "  -f, --from-file file      read the filter from a file\n"
+          "      --arg name value      set $name to the string value\n"
+          "      --argjson name json   set $name to the JSON value\n"
+          "      --slurpfile name file set $name to an array of the JSON values in file\n"
+          "      --rawfile name file   set $name to the contents of file\n"
+          "      --args                the remaining arguments are strings ($ARGS.positional)\n"
+          "      --jsonargs            the remaining arguments are JSON values\n"
+          "      --seq                 write an RS before each output; read RS-separated input\n"
+          "      --unbuffered          flush after each input\n"
+          "  -b, --binary              on Windows, write LF line ends (no CR)\n"
+          "      --threads n           worker threads for large files (1: sequential)\n"
+          "      --no-od               do not use the On-Demand fast path\n"
+          "      --no-mmap             read files instead of mapping them\n"
+          "  -V, --version\n"
           "  -h, --help\n");
+}
+
+// Reads a whole file (or standard input for "-"); false when it cannot.
+static bool read_file(const std::string &name, std::string &out) {
+  out.clear();
+  if (name == "-") {
+    char buf[65536];
+    while (true) {
+      long long r = read_stdin(buf, sizeof(buf));
+      if (r < 0) { return false; }
+      if (r == 0) { return true; }
+      out.append(buf, size_t(r));
+    }
+  }
+  input_source src;
+  if (!src.load(name, false)) { return false; }
+  out.assign(src.data(), src.size());
+  return true;
+}
+
+// Parses every JSON value of text as owned values; false on a parse error.
+static bool parse_all(const std::string &text, std::vector<value> &out, std::string &err) {
+  dom::parser parser;
+  padded_string copy(text);
+  dom::document_stream stream;
+  if (auto e = parser.parse_many(copy, std::max<size_t>(copy.size(), 1024)).get(stream)) {
+    err = error_message(e);
+    return false;
+  }
+  for (auto it = stream.begin(); it != stream.end(); ++it) {
+    dom::element doc;
+    auto e = (*it).get(doc);
+    if (e == EMPTY) { break; }
+    if (e) {
+      err = error_message(e);
+      return false;
+    }
+    out.push_back(to_owned(doc));
+  }
+  if (stream.truncated_bytes()) {
+    err = "Unfinished JSON term at EOF";
+    return false;
+  }
+  return true;
 }
 
 // Default colors and JQ_COLORS, as jq 1.8: null, false, true, numbers,
@@ -71,9 +130,9 @@ static void setup_colors(std::string *colors) {
 // MinGW GCC 16 on Windows, catching the parser's exception in main itself
 // crashed about half the runs (access violation); a separate function does
 // not.
-simdjson_never_inline node_ptr compile_or_report(const std::string &filter) {
+simdjson_never_inline node_ptr compile_or_report(const std::string &filter, const std::vector<std::string> &globals, compile_info &info) {
   try {
-    return compile(filter);
+    return compile(filter, globals, &info);
   } catch (std::exception &ex) {
     fprintf(stderr, "sjq: error: %s\n", ex.what());
     return nullptr;
@@ -84,21 +143,107 @@ int main(int argc, char **argv) {
   stack_guard_init(main_stack_budget());
   writer w{};
   bool raw = false, join = false, null_input = false, seq = false, unbuffered = false, binary = false;
+  bool slurp = false, raw_input = false, exit_status = false, raw0 = false;
   int color_mode = -1;  // -1: when stdout is a terminal
   int threads = int(std::max(1u, std::thread::hardware_concurrency()));
   bool use_od = true, use_mmap = true;
   std::string filter{};
   bool have_filter = false;
+  std::string filter_file{};
   std::vector<std::string> files{};
+  // --arg and friends: the variables, in order, and $ARGS.
+  std::vector<std::pair<std::string, value>> named{};
+  std::vector<value> positional{};
+  int rest_mode = 0;  // after --args (1) or --jsonargs (2): positional values
+  bool options_done = false;
+  auto need = [&](int i, int count, const std::string &opt) {
+    if (i + count >= argc) {
+      fprintf(stderr, "sjq: %s takes %d parameter%s\n", opt.c_str(), count, count > 1 ? "s" : "");
+      exit(2);
+    }
+  };
+  auto set_named = [&](const std::string &name, const value &v) {
+    for (auto &kv : named) {
+      if (kv.first == name) { kv.second = v; return; }
+    }
+    named.emplace_back(name, v);
+  };
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
+    bool is_option = !options_done && a.size() > 1 && a[0] == '-';
+    if (!is_option) {
+      if (!have_filter && filter_file.empty()) { filter = a; have_filter = true; continue; }
+      if (rest_mode == 1) { positional.push_back(value::string(a)); continue; }
+      if (rest_mode == 2) {
+        std::vector<value> vs;
+        std::string err;
+        if (!parse_all(a, vs, err) || vs.size() != 1) {
+          fprintf(stderr, "sjq: invalid JSON text passed to --jsonargs\n");
+          return 2;
+        }
+        positional.push_back(vs[0]);
+        continue;
+      }
+      files.push_back(a);
+      continue;
+    }
+    if (a == "--") { options_done = true; continue; }
     if (a == "-c" || a == "--compact-output") { w.pretty = false; }
     else if (a == "-r" || a == "--raw-output") { raw = true; }
     else if (a == "-j" || a == "--join-output") { raw = true; join = true; }
+    else if (a == "--raw-output0") { raw = true; raw0 = true; }
+    else if (a == "-a" || a == "--ascii-output") { w.ascii = true; }
     else if (a == "-n" || a == "--null-input") { null_input = true; }
+    else if (a == "-s" || a == "--slurp") { slurp = true; }
+    else if (a == "-R" || a == "--raw-input") { raw_input = true; }
+    else if (a == "-e" || a == "--exit-status") { exit_status = true; }
     else if (a == "-S" || a == "--sort-keys") { w.sort_keys = true; }
     else if (a == "-C" || a == "--color-output") { color_mode = 1; }
     else if (a == "-M" || a == "--monochrome-output") { color_mode = 0; }
+    else if (a == "-V" || a == "--version") { printf("sjq %s (simdjson %s)\n", SJQ_VERSION, SIMDJSON_VERSION); return 0; }
+    else if (a == "-f" || a == "--from-file") {
+      need(i, 1, a);
+      filter_file = argv[++i];
+      if (have_filter) {
+        // The first positional argument was an input file, not the filter.
+        files.insert(files.begin(), filter);
+        have_filter = false;
+      }
+    }
+    else if (a == "--arg") { need(i, 2, a); set_named(argv[i + 1], value::string(argv[i + 2])); i += 2; }
+    else if (a == "--argjson") {
+      need(i, 2, a);
+      std::vector<value> vs;
+      std::string err;
+      if (!parse_all(argv[i + 2], vs, err) || vs.size() != 1) {
+        fprintf(stderr, "sjq: invalid JSON text passed to --argjson\n");
+        return 2;
+      }
+      set_named(argv[i + 1], vs[0]);
+      i += 2;
+    }
+    else if (a == "--slurpfile" || a == "--rawfile") {
+      need(i, 2, a);
+      std::string text;
+      if (!read_file(argv[i + 2], text)) {
+        fprintf(stderr, "sjq: error: could not open %s\n", argv[i + 2]);
+        return 2;
+      }
+      if (a == "--rawfile") {
+        set_named(argv[i + 1], value::string(text));
+      } else {
+        std::vector<value> vs;
+        std::string err;
+        if (!parse_all(text, vs, err)) {
+          fprintf(stderr, "sjq: error: %s: %s\n", argv[i + 2], err.c_str());
+          return 2;
+        }
+        set_named(argv[i + 1], value::array(std::move(vs)));
+      }
+      i += 2;
+    }
+    else if (a == "--args") { rest_mode = 1; }
+    else if (a == "--jsonargs") { rest_mode = 2; }
     else if (a == "--tab") { w.tab = true; w.pretty = true; }
     else if (a == "--indent") {
       if (i + 1 >= argc) { fprintf(stderr, "sjq: --indent takes one parameter\n"); return 2; }
@@ -119,7 +264,7 @@ int main(int argc, char **argv) {
       threads = std::max(1, atoi(argv[++i]));
     }
     else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
-    else if (a.size() > 1 && a[0] == '-' && !have_filter && a.find_first_not_of("crjnSMCb", 1) == std::string::npos) {
+    else if (a[1] != '-' && a.find_first_not_of("crjnSMCbsRea", 1) == std::string::npos) {
       // Combined short flags such as -rc.
       for (size_t j = 1; j < a.size(); j++) {
         switch (a[j]) {
@@ -131,11 +276,24 @@ int main(int argc, char **argv) {
         case 'C': color_mode = 1; break;
         case 'M': color_mode = 0; break;
         case 'b': binary = true; break;
+        case 's': slurp = true; break;
+        case 'R': raw_input = true; break;
+        case 'e': exit_status = true; break;
+        case 'a': w.ascii = true; break;
         }
       }
     }
-    else if (!have_filter) { filter = a; have_filter = true; }
-    else { files.push_back(a); }
+    else {
+      fprintf(stderr, "sjq: unknown option %s (see sjq --help)\n", a.c_str());
+      return 2;
+    }
+  }
+  if (!filter_file.empty()) {
+    if (!read_file(filter_file, filter)) {
+      fprintf(stderr, "sjq: error: could not open %s\n", filter_file.c_str());
+      return 2;
+    }
+    have_filter = true;
   }
   if (!have_filter) { usage(stderr); return 2; }
 
@@ -151,21 +309,38 @@ int main(int argc, char **argv) {
   // Output reaches a terminal (or the user asked for it) as each input is done.
   const bool flush_each = unbuffered || terminal;
 
-  node_ptr prog = compile_or_report(filter);
+  std::vector<std::string> globals{"ARGS"};
+  for (auto &kv : named) { globals.push_back(kv.first); }
+  compile_info info{};
+  node_ptr prog = compile_or_report(filter, globals, info);
   if (!prog) { return 3; }
+  // The variables of --arg and friends, and $ARGS.
+  env_ptr root_env{};
+  root_env = push_var("ARGS", value::object({{"positional", value::array(positional)}, {"named", value::object(named)}}), root_env);
+  for (auto &kv : named) { root_env = push_var(kv.first, kv.second, root_env); }
 
+  // With -e, the exit status depends on the last output: the outputs must be
+  // seen in order, by the main thread. Regular expressions recurse deeply in
+  // std::regex: they stay on the main thread with its large stack.
+  if (exit_status || info.uses_regex) { threads = 1; }
   od_ptr plan{};
-  if (use_od && !w.sort_keys) { plan = od_compile(prog.get()); }
+  if (use_od && !w.sort_keys && !w.ascii && !raw0 && !exit_status) { plan = od_compile(prog.get()); }
   if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: %s path\n", plan ? "On-Demand" : "DOM"); }
 
   int status = 0;
-  env_ptr root_env{};
+  int last_output = -1;  // -e: -1 no output, 0 false or null, 1 other
   auto emit = [&](const value &v) {
     if (seq) { w.put('\x1e'); }
     if (raw && v.k == K::Str) { w.put(get_str(v)); }
     else { w.write_value(v, 0); }
-    if (!join) { w.put('\n'); }
+    if (raw0) { w.put('\0'); }
+    else if (!join) { w.put('\n'); }
+    last_output = truthy(v) ? 1 : 0;
     w.maybe_flush();
+  };
+  auto final_status = [&](int st) {
+    if (!exit_status || st != 0) { return st; }
+    return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
   };
   // jq reports the number of lines consumed when an error happens. line_count
   // counts the newlines of the current buffer before line_pos.
@@ -190,26 +365,131 @@ int main(int argc, char **argv) {
       status = 0;
     } catch (jq_error &err) {
       w.flush();
-      fprintf(stderr, "jq: error (at %s): %s\n", location(name).c_str(), err.what());
+      if (err.has_payload && err.payload.k != K::Str) {
+        fprintf(stderr, "sjq: error (at %s) (not a string): %s\n", location(name).c_str(), to_json(err.payload).c_str());
+      } else {
+        fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), err.what());
+      }
       status = 5;
+    } catch (halt_signal &h) {
+      w.flush();
+      fputs(h.message.c_str(), stderr);
+      fflush(stderr);
+      exit(h.code);
     } catch (break_signal &) {
       w.flush();
-      fprintf(stderr, "jq: error (at %s): break\n", name);
+      fprintf(stderr, "sjq: error (at %s): break\n", name);
       status = 5;
     } catch (std::exception &ex) {
       w.flush();
-      fprintf(stderr, "jq: error (at %s): %s\n", location(name).c_str(), ex.what());
+      fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), ex.what());
       status = 5;
     }
   };
 
+  if (files.empty()) { files.push_back("-"); }
+
+  // -s, -R and filters that call input/inputs read the inputs in order, as
+  // owned values (a value must outlive the reading of the next one).
+  if (slurp || raw_input || info.uses_input) {
+    size_t next_file = 0;
+    std::vector<value> pending;
+    size_t pending_at = 0;
+    bool slurped = false, failed = false;
+    std::string current_name;
+    // Loads the values of the next file into pending; false at the end.
+    auto load_next = [&]() -> bool {
+      while (next_file < files.size()) {
+        const std::string &fname = files[next_file++];
+        current_name = fname;
+        g_input_filename = fname == "-" ? nullptr : fname.c_str();
+        std::string text;
+        if (!read_file(fname, text)) {
+          fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+          status = 2;
+          continue;
+        }
+        pending.clear();
+        pending_at = 0;
+        if (raw_input) {
+          size_t pos = 0;
+          while (pos < text.size()) {
+            size_t nl = text.find('\n', pos);
+            if (nl == std::string::npos) { pending.push_back(value::string(text.substr(pos))); break; }
+            pending.push_back(value::string(text.substr(pos, nl - pos)));
+            pos = nl + 1;
+          }
+        } else {
+          std::string err;
+          if (!parse_all(text, pending, err)) {
+            w.flush();
+            fprintf(stderr, "sjq: error (at %s): %s\n", fname == "-" ? "<stdin>" : fname.c_str(), err.c_str());
+            status = 2;
+            failed = true;
+          }
+        }
+        if (!pending.empty()) { return true; }
+        if (failed) { return false; }
+      }
+      return false;
+    };
+    // With -s, all inputs make one value (a string with -R).
+    std::function<bool(value &)> next_value;
+    if (slurp) {
+      next_value = [&](value &v) -> bool {
+        if (slurped) { return false; }
+        slurped = true;
+        if (raw_input) {
+          std::string all;
+          for (const auto &fname : files) {
+            std::string text;
+            if (!read_file(fname, text)) {
+              fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+              status = 2;
+              continue;
+            }
+            all += text;
+          }
+          v = value::string(std::move(all));
+          return true;
+        }
+        std::vector<value> all;
+        while (load_next()) {
+          for (auto &x : pending) { all.push_back(std::move(x)); }
+          pending.clear();
+        }
+        v = value::array(std::move(all));
+        return true;
+      };
+    } else {
+      next_value = [&](value &v) -> bool {
+        while (pending_at >= pending.size()) {
+          if (failed || !load_next()) { return false; }
+        }
+        v = std::move(pending[pending_at++]);
+        return true;
+      };
+    }
+    g_next_input = next_value;
+    if (null_input) {
+      run(value::null(), "<unknown>");
+    } else {
+      value v;
+      while (next_value(v)) {
+        value in = std::move(v);
+        run(in, current_name == "-" ? "<stdin>" : current_name.c_str());
+      }
+    }
+    if (failed) { status = 2; }
+    w.flush();
+    return final_status(status);
+  }
+
   if (null_input) {
     run(value::null(), "<unknown>");
     w.flush();
-    return status;
+    return final_status(status);
   }
-
-  if (files.empty()) { files.push_back("-"); }
   if (use_mmap) { install_fault_handler(); }
   dom::parser parser{};
   ondemand::parser od_parser{};
@@ -241,7 +521,7 @@ int main(int argc, char **argv) {
         }
         if (err == EMPTY) { return false; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "jq: error (at %s): %s\n", name, error_message(err)); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(err)); }
         status = 5;
         failed = fatal = true;
         return false;
@@ -272,7 +552,7 @@ int main(int argc, char **argv) {
             auto derr = parser.parse(src.data(), src.size(), true).get(el);
             if (derr) {
               w.flush();
-              if (!input_changed()) { fprintf(stderr, "jq: error (at %s): %s\n", name, error_message(derr)); }
+              if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(derr)); }
               status = 5;
               failed = fatal = true;
               break;
@@ -309,7 +589,7 @@ int main(int argc, char **argv) {
       if (truncated) {
         if (!at_eof) { return offset + slen - truncated; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "jq: error (at %s): Unfinished JSON term at EOF\n", name); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): Unfinished JSON term at EOF\n", name); }
         status = 5;
         fatal = true;
       }
@@ -544,6 +824,7 @@ int main(int argc, char **argv) {
 
   for (const std::string &fname : files) {
     fatal = false;
+    g_input_filename = fname == "-" ? nullptr : fname.c_str();
     if (fname == "-") {
       if (stdin_is_regular_file()) {
         input_source input;
@@ -564,5 +845,5 @@ int main(int argc, char **argv) {
     run_input(input, fname.c_str());
   }
   w.flush();
-  return status;
+  return final_status(status);
 }

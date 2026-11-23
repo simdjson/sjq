@@ -77,9 +77,17 @@ struct heap {
 
 struct jq_error : std::runtime_error {
   value payload{};
+  bool has_payload{false};  // error(v): the handler of catch receives v
   explicit jq_error(const std::string &m) : std::runtime_error(m) {}
+  jq_error(const std::string &m, const value &v) : std::runtime_error(m), payload(v), has_payload(true) {}
 };
 struct break_signal { int label; };
+// halt and halt_error: stop sjq with this exit status, after writing the
+// message to standard error.
+struct halt_signal {
+  int code;
+  std::string message;
+};
 
 // Evaluation recurses through nested filters (recurse(f), generators) and
 // nested values. Each thread records where its stack starts and how much of

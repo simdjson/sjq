@@ -163,9 +163,9 @@ def jq_test_passes(sjq, kind, program, inp, outs):
     if kind == "fail":
         # %%FAIL programs must be rejected at compile time (exit status 3),
         # not crash or time out.
-        code, _, _ = run([sjq, "-n", program], timeout=10)
+        code, _, _ = run([sjq, "-n", "--", program], timeout=10)
         return code == 3
-    code, out, _ = run([sjq, "-c", program], (inp + "\n").encode("utf-8"), timeout=10)
+    code, out, _ = run([sjq, "-c", "--", program], (inp + "\n").encode("utf-8"), timeout=10)
     if code != 0:
         return False
     try:
@@ -207,7 +207,7 @@ def jqsuite(sjq, update):
                 details.append(f"  {tid}: no such test")
                 continue
             kind, program, inp = tests[tid]
-            argv = [sjq, "-n", program] if kind == "fail" else [sjq, "-c", program]
+            argv = [sjq, "-n", "--", program] if kind == "fail" else [sjq, "-c", "--", program]
             start = time.time()
             code, out, err = run(argv, b"" if kind == "fail" else (inp + "\n").encode("utf-8"), timeout=10)
             details.append(f"  {tid}: {program[:60]!r} exit {code} in {time.time() - start:.1f} s, "

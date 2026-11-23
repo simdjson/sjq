@@ -3,6 +3,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 namespace sjq {
 
@@ -12,12 +14,17 @@ struct token {
   T t;
   std::string s{};
   double num{0};
+  // A string with interpolations: literal parts at even indexes, the source
+  // of the expressions at odd indexes.
+  std::vector<std::string> parts{};
+  int line{1};
 };
 
 struct lexer {
   std::string src{};
   size_t i{0};
   std::vector<token> toks{};
+  int base_line{1};  // line of src[0] in the whole filter
 
   [[noreturn]] void fail(const std::string &m) { throw std::runtime_error("syntax error: " + m); }
 
@@ -42,100 +49,185 @@ struct lexer {
     return cp;
   }
 
-  std::string read_string() {
-    // i points after the opening quote.
-    std::string r;
+  int line_at(size_t pos) const {
+    return base_line + int(std::count(src.begin(), src.begin() + std::ptrdiff_t(std::min(pos, src.size())), '\n'));
+  }
+
+  // Skips a string literal; at points after its opening quote. Returns the
+  // index after the closing quote.
+  size_t skip_string(size_t at) {
+    while (at < src.size() && src[at] != '"') {
+      if (src[at] == '\\') {
+        if (at + 1 < src.size() && src[at + 1] == '(') { at = skip_interp(at + 2) + 1; continue; }
+        at += 2;
+        continue;
+      }
+      at++;
+    }
+    if (at >= src.size()) { fail("unterminated string"); }
+    return at + 1;
+  }
+  // Finds the ')' that closes an interpolation; at points after "\(".
+  size_t skip_interp(size_t at) {
+    int depth = 0;
+    while (at < src.size()) {
+      char c = src[at];
+      if (c == '"') { at = skip_string(at + 1); continue; }
+      if (c == '#') {
+        while (at < src.size() && src[at] != '\n') { at++; }
+        continue;
+      }
+      if (c == '(') { depth++; }
+      if (c == ')') {
+        if (depth == 0) { return at; }
+        depth--;
+      }
+      at++;
+    }
+    fail("unterminated string interpolation");
+  }
+
+  // Reads a string literal; i points after the opening quote. Returns the
+  // parts (one literal part when there is no interpolation).
+  std::vector<std::string> read_string() {
+    std::vector<std::string> parts(1);
     while (i < src.size() && src[i] != '"') {
+      std::string &r = parts.back();
       char c = src[i++];
-      if (c == '\\') {
-        if (i >= src.size()) { fail("unterminated string"); }
-        char d = src[i++];
-        switch (d) {
-        case 'n': r.push_back('\n'); break;
-        case 't': r.push_back('\t'); break;
-        case 'r': r.push_back('\r'); break;
-        case 'b': r.push_back('\b'); break;
-        case 'f': r.push_back('\f'); break;
-        case '/': r.push_back('/'); break;
-        case '\\': r.push_back('\\'); break;
-        case '"': r.push_back('"'); break;
-        case 'u': {
-          unsigned cp = hex4(i);
-          i += 4;
-          if (cp >= 0xDC00 && cp < 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
-          if (cp >= 0xD800 && cp < 0xDC00) {
-            if (i + 2 > src.size() || src[i] != '\\' || src[i + 1] != 'u') { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
-            unsigned lo = hex4(i + 2);
-            if (lo < 0xDC00 || lo >= 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
-            i += 6;
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-          }
-          if (cp < 0x80) { r.push_back(char(cp)); }
-          else if (cp < 0x800) { r.push_back(char(0xC0 | (cp >> 6))); r.push_back(char(0x80 | (cp & 0x3F))); }
-          else if (cp < 0x10000) { r.push_back(char(0xE0 | (cp >> 12))); r.push_back(char(0x80 | ((cp >> 6) & 0x3F))); r.push_back(char(0x80 | (cp & 0x3F))); }
-          else { r.push_back(char(0xF0 | (cp >> 18))); r.push_back(char(0x80 | ((cp >> 12) & 0x3F))); r.push_back(char(0x80 | ((cp >> 6) & 0x3F))); r.push_back(char(0x80 | (cp & 0x3F))); }
-          break;
-        }
-        case '(': fail("string interpolation is not supported");
-        default: fail(std::string("bad escape \\") + d);
-        }
-      } else {
+      if (c != '\\') {
         r.push_back(c);
+        continue;
+      }
+      if (i >= src.size()) { fail("unterminated string"); }
+      char d = src[i++];
+      switch (d) {
+      case 'n': r.push_back('\n'); break;
+      case 't': r.push_back('\t'); break;
+      case 'r': r.push_back('\r'); break;
+      case 'b': r.push_back('\b'); break;
+      case 'f': r.push_back('\f'); break;
+      case '/': r.push_back('/'); break;
+      case '\\': r.push_back('\\'); break;
+      case '"': r.push_back('"'); break;
+      case 'u': {
+        unsigned cp = hex4(i);
+        i += 4;
+        if (cp >= 0xDC00 && cp < 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+        if (cp >= 0xD800 && cp < 0xDC00) {
+          if (i + 2 > src.size() || src[i] != '\\' || src[i + 1] != 'u') { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+          unsigned lo = hex4(i + 2);
+          if (lo < 0xDC00 || lo >= 0xE000) { fail("invalid \\uXXXX\\uXXXX surrogate pair escape"); }
+          i += 6;
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        }
+        if (cp < 0x80) { r.push_back(char(cp)); }
+        else if (cp < 0x800) { r.push_back(char(0xC0 | (cp >> 6))); r.push_back(char(0x80 | (cp & 0x3F))); }
+        else if (cp < 0x10000) { r.push_back(char(0xE0 | (cp >> 12))); r.push_back(char(0x80 | ((cp >> 6) & 0x3F))); r.push_back(char(0x80 | (cp & 0x3F))); }
+        else { r.push_back(char(0xF0 | (cp >> 18))); r.push_back(char(0x80 | ((cp >> 12) & 0x3F))); r.push_back(char(0x80 | ((cp >> 6) & 0x3F))); r.push_back(char(0x80 | (cp & 0x3F))); }
+        break;
+      }
+      case '(': {
+        size_t close = skip_interp(i);
+        parts.push_back(src.substr(i, close - i));
+        parts.emplace_back();
+        i = close + 1;
+        break;
+      }
+      default: fail(std::string("bad escape \\") + d);
       }
     }
     if (i >= src.size()) { fail("unterminated string"); }
     i++;
-    return r;
+    return parts;
+  }
+
+  void push(T t, std::string s, size_t at) {
+    token tk{t, std::move(s)};
+    tk.line = line_at(at);
+    toks.push_back(std::move(tk));
   }
 
   void run() {
-    static const char *keywords[] = {"if", "then", "elif", "else", "end", "as", "reduce", "foreach", "and", "or", "try", "catch", "label", "def"};
+    static const char *keywords[] = {"if", "then", "elif", "else", "end", "as", "reduce", "foreach", "and", "or",
+                                     "try", "catch", "label", "def", "import", "include"};
     while (true) {
       while (i < src.size() && isspace((unsigned char)src[i])) { i++; }
       if (i < src.size() && src[i] == '#') { while (i < src.size() && src[i] != '\n') { i++; } continue; }
-      if (i >= src.size()) { toks.push_back({T::End, ""}); return; }
+      if (i >= src.size()) { push(T::End, "", i); return; }
+      size_t start = i;
       char c = src[i];
       if (c == '.') {
-        if (i + 1 < src.size() && src[i + 1] == '.') { i += 2; toks.push_back({T::DotDot, ".."}); continue; }
+        if (i + 1 < src.size() && src[i + 1] == '.') { i += 2; push(T::DotDot, "..", start); continue; }
         if (i + 1 < src.size() && ident_start(src[i + 1])) {
           size_t j = i + 1;
           while (j < src.size() && ident_char(src[j])) { j++; }
-          toks.push_back({T::Field, src.substr(i + 1, j - i - 1)});
+          push(T::Field, src.substr(i + 1, j - i - 1), start);
           i = j;
           continue;
         }
         if (i + 1 < src.size() && src[i + 1] == '"') {
           i += 2;
-          toks.push_back({T::Field, read_string()});
+          auto parts = read_string();
+          if (parts.size() > 1) { fail("string interpolation in a field name is not supported"); }
+          push(T::Field, std::move(parts[0]), start);
           continue;
         }
         i++;
-        toks.push_back({T::Dot, "."});
+        push(T::Dot, ".", start);
         continue;
       }
       if (c == '$') {
         size_t j = i + 1;
-        while (j < src.size() && ident_char(src[j])) { j++; }
-        toks.push_back({T::Var, src.substr(i + 1, j - i - 1)});
+        while (j < src.size() && (ident_char(src[j]) || (src[j] == ':' && j + 1 < src.size() && src[j + 1] == ':'))) {
+          if (src[j] == ':') { j++; }
+          j++;
+        }
+        if (j == i + 1) { fail("expected a variable name after '$'"); }
+        push(T::Var, src.substr(i + 1, j - i - 1), start);
         i = j;
         continue;
       }
       if (c == '@') {
         size_t j = i + 1;
         while (j < src.size() && ident_char(src[j])) { j++; }
-        toks.push_back({T::Format, src.substr(i + 1, j - i - 1)});
+        push(T::Format, src.substr(i + 1, j - i - 1), start);
         i = j;
         continue;
       }
       if (isdigit((unsigned char)c)) {
-        char *endp = nullptr;
-        double d = strtod(src.c_str() + i, &endp);
-        size_t j = size_t(endp - src.c_str());
-        toks.push_back({T::Num, src.substr(i, j - i), d});
+        // Digits, an optional fraction and an optional exponent (strtod
+        // alone would also take hexadecimal numbers, "inf" and "nan").
+        size_t j = i;
+        while (j < src.size() && isdigit((unsigned char)src[j])) { j++; }
+        if (j < src.size() && src[j] == '.') {
+          j++;
+          while (j < src.size() && isdigit((unsigned char)src[j])) { j++; }
+        }
+        if (j < src.size() && (src[j] == 'e' || src[j] == 'E')) {
+          size_t k = j + 1;
+          if (k < src.size() && (src[k] == '+' || src[k] == '-')) { k++; }
+          if (k < src.size() && isdigit((unsigned char)src[k])) {
+            while (k < src.size() && isdigit((unsigned char)src[k])) { k++; }
+            j = k;
+          }
+        }
+        std::string text = src.substr(i, j - i);
+        push(T::Num, text, start);
+        toks.back().num = strtod(text.c_str(), nullptr);
         i = j;
         continue;
       }
-      if (c == '"') { i++; toks.push_back({T::Str, read_string()}); continue; }
+      if (c == '"') {
+        i++;
+        auto parts = read_string();
+        if (parts.size() == 1) {
+          push(T::Str, std::move(parts[0]), start);
+        } else {
+          push(T::Str, "", start);
+          toks.back().parts = std::move(parts);
+        }
+        continue;
+      }
       if (ident_start(c)) {
         size_t j = i;
         while (j < src.size() && (ident_char(src[j]) || (src[j] == ':' && j + 1 < src.size() && src[j + 1] == ':'))) {
@@ -146,40 +238,119 @@ struct lexer {
         i = j;
         bool kw = false;
         for (auto k : keywords) { if (w == k) { kw = true; } }
-        toks.push_back({kw ? T::Keyword : T::Ident, w});
+        push(kw ? T::Keyword : T::Ident, w, start);
         continue;
       }
       // jq lexes ?// (destructuring alternatives) as one token.
-      if (src.compare(i, 3, "?//") == 0) { fail("?// is not supported"); }
-      static const char *two[] = {"==", "!=", "<=", ">=", "//"};
+      if (src.compare(i, 3, "?//") == 0) { push(T::Punct, "?//", start); i += 3; continue; }
+      if (src.compare(i, 3, "//=") == 0) { push(T::Punct, "//=", start); i += 3; continue; }
+      static const char *two[] = {"==", "!=", "<=", ">=", "//", "|=", "+=", "-=", "*=", "/=", "%="};
       bool matched = false;
       for (auto p : two) {
-        if (src.compare(i, 2, p) == 0) { toks.push_back({T::Punct, p}); i += 2; matched = true; break; }
+        if (src.compare(i, 2, p) == 0) { push(T::Punct, p, start); i += 2; matched = true; break; }
       }
       if (matched) { continue; }
-      if (strchr("|,()[]{}:;<>+-*/%?", c)) { toks.push_back({T::Punct, std::string(1, c)}); i++; continue; }
+      if (strchr("|,()[]{}:;<>+-*/%?=", c)) { push(T::Punct, std::string(1, c), start); i++; continue; }
       fail(std::string("unexpected character '") + c + "'");
     }
   }
 };
+
+// The functions of the prelude, by name/arity, and their frames.
+using prelude_table = std::unordered_map<std::string, env_ptr>;
 
 struct parser_t {
   std::vector<token> toks{};
   size_t p{0};
   int next_label{0};
   std::vector<std::pair<std::string, int>> labels{};
+  // Names in scope: variables ("x") and functions or closures ("f/1").
+  std::vector<std::string> scope{};
+  std::vector<std::string> globals{};
+  const prelude_table *prelude{nullptr};
+  compile_info info{};
 
   [[noreturn]] void fail(const std::string &m) {
     throw std::runtime_error("syntax error: " + m + " near '" + toks[p].s + "'");
   }
+  [[noreturn]] void fail_plain(const std::string &m) { throw std::runtime_error(m); }
   const token &peek() const { return toks[p]; }
   bool is_punct(const char *s) const { return toks[p].t == T::Punct && toks[p].s == s; }
   bool is_kw(const char *s) const { return toks[p].t == T::Keyword && toks[p].s == s; }
   void expect_punct(const char *s) { if (!is_punct(s)) { fail(std::string("expected '") + s + "'"); } p++; }
   void expect_kw(const char *s) { if (!is_kw(s)) { fail(std::string("expected '") + s + "'"); } p++; }
 
-  // pipe: lowest precedence; handles "term as $x | body" and "def".
+  bool in_scope(const std::string &key) const {
+    for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+      if (*it == key) { return true; }
+    }
+    return false;
+  }
+  void check_var(const std::string &name) {
+    if (in_scope(name)) { return; }
+    for (const auto &g : globals) { if (g == name) { return; } }
+    fail_plain("$" + name + " is not defined");
+  }
+
+  // Each nested term recurses; deep nesting would overflow the stack.
+  int depth{0};
+  static constexpr int MAX_DEPTH = 256;
+  struct depth_guard {
+    parser_t &p;
+    explicit depth_guard(parser_t &parser) : p(parser) {
+      if (++p.depth > MAX_DEPTH) { p.fail("filter nested too deeply"); }
+    }
+    ~depth_guard() { p.depth--; }
+    depth_guard(const depth_guard &) = delete;
+    depth_guard &operator=(const depth_guard &) = delete;
+  };
+
+  // def name: body;   def name(f; $x): body;
+  std::unique_ptr<def_node> parse_def() {
+    expect_kw("def");
+    if (peek().t != T::Ident && peek().t != T::Keyword) { fail("expected a function name after def"); }
+    auto d = std::make_unique<func_def>();
+    d->name = toks[p++].s;
+    if (is_punct("(")) {
+      p++;
+      while (true) {
+        if (peek().t == T::Var) { d->params.push_back(toks[p++].s); d->by_value.push_back(true); }
+        else if (peek().t == T::Ident || peek().t == T::Keyword) { d->params.push_back(toks[p++].s); d->by_value.push_back(false); }
+        else { fail("expected a parameter"); }
+        if (is_punct(";")) { p++; continue; }
+        expect_punct(")");
+        break;
+      }
+    }
+    expect_punct(":");
+    auto n = std::make_unique<def_node>();
+    n->key = d->name + "/" + std::to_string(d->params.size());
+    // The function is in scope in its own body (recursion) and after it.
+    scope.push_back(n->key);
+    size_t mark = scope.size();
+    for (size_t k = 0; k < d->params.size(); k++) {
+      d->keys.push_back(d->params[k] + "/0");
+      scope.push_back(d->keys.back());
+      if (d->by_value[k]) { scope.push_back(d->params[k]); }
+    }
+    d->body = parse_pipe();
+    scope.resize(mark);
+    expect_punct(";");
+    n->def = std::move(d);
+    return n;
+  }
+
+  // pipe: lowest precedence; handles "def" and "label".
   node_ptr parse_pipe() {
+    depth_guard guard(*this);
+    if (is_kw("def")) {
+      // parse_def leaves the function in scope for the rest only.
+      size_t mark = scope.size();
+      auto n = parse_def();
+      n->rest = parse_pipe();
+      scope.resize(mark);
+      return n;
+    }
     if (is_kw("label")) {
       p++;
       if (peek().t != T::Var) { fail("expected $label"); }
@@ -193,16 +364,6 @@ struct parser_t {
       return n;
     }
     node_ptr lhs = parse_comma();
-    if (is_kw("as")) {
-      p++;
-      if (peek().t != T::Var) { fail("expected variable after 'as'"); }
-      auto n = std::make_unique<bind_node>();
-      n->name = toks[p++].s;
-      expect_punct("|");
-      n->source = std::move(lhs);
-      n->body = parse_pipe();
-      return n;
-    }
     if (is_punct("|")) {
       p++;
       auto n = std::make_unique<pipe_node>();
@@ -214,15 +375,45 @@ struct parser_t {
   }
 
   node_ptr parse_comma() {
-    node_ptr lhs = parse_alt();
+    node_ptr lhs = parse_alt_as();
     while (is_punct(",")) {
       p++;
       auto n = std::make_unique<comma_node>();
       n->a = std::move(lhs);
-      n->b = parse_alt();
+      n->b = parse_alt_as();
       lhs = std::move(n);
     }
     return lhs;
+  }
+
+  // e as $x | body: as in jq 1.8, the source is everything that binds more
+  // tightly than ',' (1 + 2 as $x is (1 + 2) as $x), and the body extends as
+  // far right as possible.
+  node_ptr parse_alt_as() {
+    node_ptr e = parse_alt();
+    if (!is_kw("as")) { return e; }
+    p++;
+    auto n = std::make_unique<bind_node>();
+    n->source = std::move(e);
+    size_t mark = scope.size();
+    parse_pattern(n->pat);
+    // Destructuring alternatives: $a ?// [$a] ?// {a: $a}.
+    while (is_punct("?//")) {
+      p++;
+      n->alts.emplace_back();
+      parse_pattern(n->alts.back());
+    }
+    if (!n->alts.empty()) {
+      // Every variable of every alternative is bound (null when absent).
+      std::vector<std::string> names(scope.begin() + std::ptrdiff_t(mark), scope.end());
+      std::sort(names.begin(), names.end());
+      names.erase(std::unique(names.begin(), names.end()), names.end());
+      n->all_vars = names;
+    }
+    expect_punct("|");
+    n->body = parse_pipe();
+    scope.resize(mark);
+    return n;
   }
 
   node_ptr make_bin(op o, node_ptr a, node_ptr b) {
@@ -233,11 +424,30 @@ struct parser_t {
     return n;
   }
 
+  // As in jq's grammar, "//" binds more loosely than the assignment
+  // operators: .a |= . // 1 is (.a |= .) // 1.
   node_ptr parse_alt() {
-    node_ptr lhs = parse_or();
+    node_ptr lhs = parse_assign();
     if (is_punct("//")) {
       p++;
       return make_bin(op::alt, std::move(lhs), parse_alt());  // right-associative
+    }
+    return lhs;
+  }
+  node_ptr parse_assign() {
+    node_ptr lhs = parse_or();
+    static const std::pair<const char *, assign_op> ops[] = {
+        {"=", assign_op::set}, {"|=", assign_op::update}, {"+=", assign_op::add}, {"-=", assign_op::sub},
+        {"*=", assign_op::mul}, {"/=", assign_op::div}, {"%=", assign_op::mod}, {"//=", assign_op::alt}};
+    for (auto &o : ops) {
+      if (is_punct(o.first)) {
+        p++;
+        auto n = std::make_unique<assign_node>();
+        n->o = o.second;
+        n->lhs = std::move(lhs);
+        n->rhs = parse_or();
+        return n;
+      }
     }
     return lhs;
   }
@@ -321,6 +531,79 @@ struct parser_t {
     else if (auto it = dynamic_cast<iterate_node *>(n)) { it->opt = true; }
   }
 
+  // jq rejects constant object keys that are not strings when it compiles.
+  void check_const_key(const node *key) {
+    auto lit = dynamic_cast<const literal_node *>(key);
+    if (lit && lit->v.k != K::Str) {
+      fail_plain(std::string("Cannot use ") + kind_name(lit->v.k) + " (" + error_text(lit->v) + ") as object key");
+    }
+  }
+
+  // Patterns: $name, [p, ...], {key: p, $name, $name: p, "str": p, (e): p}.
+  // The variables they bind are pushed on the scope.
+  void parse_pattern(pattern &pat) {
+    depth_guard guard(*this);
+    if (peek().t == T::Var) {
+      pat.k = pattern::kind::var;
+      pat.name = toks[p++].s;
+      scope.push_back(pat.name);
+      return;
+    }
+    if (is_punct("[")) {
+      p++;
+      pat.k = pattern::kind::array;
+      while (true) {
+        pat.elems.emplace_back();
+        parse_pattern(pat.elems.back());
+        if (is_punct(",")) { p++; continue; }
+        expect_punct("]");
+        return;
+      }
+    }
+    if (is_punct("{")) {
+      p++;
+      pat.k = pattern::kind::object;
+      while (true) {
+        pattern::field f;
+        const token &k = peek();
+        if (k.t == T::Var) {
+          f.var = k.s;
+          auto lit = std::make_unique<literal_node>();
+          lit->v = value::string(k.s);
+          f.key = std::move(lit);
+          p++;
+          scope.push_back(f.var);
+        } else if (k.t == T::Ident || k.t == T::Keyword) {
+          auto lit = std::make_unique<literal_node>();
+          lit->v = value::string(k.s);
+          f.key = std::move(lit);
+          p++;
+        } else if (k.t == T::Str) {
+          f.key = parse_term();
+        } else if (is_punct("(")) {
+          p++;
+          f.key = parse_pipe();
+          expect_punct(")");
+          check_const_key(f.key.get());
+        } else {
+          fail("bad object pattern");
+        }
+        if (is_punct(":")) {
+          p++;
+          f.sub = std::make_unique<pattern>();
+          parse_pattern(*f.sub);
+        } else if (f.var.empty()) {
+          fail("object pattern key needs a variable");
+        }
+        pat.fields.push_back(std::move(f));
+        if (is_punct(",")) { p++; continue; }
+        expect_punct("}");
+        return;
+      }
+    }
+    fail("expected a pattern");
+  }
+
   bool paren_term{false};
 
   node_ptr parse_postfix() {
@@ -338,6 +621,14 @@ struct parser_t {
         p++;
         t = parse_bracket_suffix(std::move(t));
         bare_step = true;
+      } else if (peek().t == T::Dot && toks[p + 1].t == T::Str && toks[p + 1].parts.empty()) {
+        // ."foo" lexed as two tokens after a term: .a."b"
+        p++;
+        auto n = std::make_unique<field_node>();
+        n->target = std::move(t);
+        n->name = toks[p++].s;
+        t = std::move(n);
+        bare_step = true;
       } else if (is_punct("[")) {
         t = parse_bracket_suffix(std::move(t));
         bare_step = true;
@@ -353,25 +644,67 @@ struct parser_t {
           n->body = std::move(t);
           t = std::move(n);
         }
-      } else if (is_kw("as") && false) {
       } else {
         return t;
       }
     }
   }
 
-  // Each nested term recurses; deep nesting would overflow the stack.
-  int depth{0};
-  static constexpr int MAX_DEPTH = 256;
-  struct depth_guard {
-    parser_t &p;
-    explicit depth_guard(parser_t &parser) : p(parser) {
-      if (++p.depth > MAX_DEPTH) { p.fail("filter nested too deeply"); }
+  // A string token, with its interpolations parsed in the current scope.
+  node_ptr string_term(const token &tk, const std::string &format) {
+    if (tk.parts.empty()) {
+      auto n = std::make_unique<literal_node>();
+      n->v = value::string(tk.s);
+      return n;
     }
-    ~depth_guard() { p.depth--; }
-    depth_guard(const depth_guard &) = delete;
-    depth_guard &operator=(const depth_guard &) = delete;
-  };
+    auto n = std::make_unique<string_node>();
+    n->format = format;
+    for (size_t k = 0; k < tk.parts.size(); k++) {
+      if (k % 2 == 0) { n->lits.push_back(tk.parts[k]); continue; }
+      lexer lx{};
+      lx.src = tk.parts[k];
+      lx.base_line = tk.line;
+      lx.run();
+      std::vector<token> saved = std::move(toks);
+      size_t saved_p = p;
+      toks = std::move(lx.toks);
+      p = 0;
+      node_ptr e = parse_pipe();
+      if (peek().t != T::End) { fail("unexpected token in string interpolation"); }
+      toks = std::move(saved);
+      p = saved_p;
+      n->exprs.push_back(std::move(e));
+    }
+    return n;
+  }
+
+  node_ptr make_call(std::string name, std::vector<node_ptr> args) {
+    auto n = std::make_unique<call_node>();
+    n->name = std::move(name);
+    n->args = std::move(args);
+    n->key = n->name + "/" + std::to_string(n->args.size());
+    static const char *const regex_functions[] = {"test", "match", "capture", "scan", "split", "splits", "sub", "gsub"};
+    for (const char *r : regex_functions) {
+      if (n->name == r && (n->args.size() >= 2 || (n->name != "split" && !n->args.empty()))) { info.uses_regex = true; }
+    }
+    if (n->key == "input/0" || n->key == "inputs/0") { info.uses_input = true; }
+    if (in_scope(n->key)) {
+      n->k = call_node::kind::dynamic;
+      return n;
+    }
+    if (prelude) {
+      auto it = prelude->find(n->key);
+      if (it != prelude->end()) {
+        n->k = call_node::kind::prelude;
+        n->target = it->second;
+        return n;
+      }
+    }
+    n->fn = find_builtin(n->key);
+    n->pfn = find_builtin_paths(n->key);
+    if (!n->fn) { fail_plain(n->key + " is not defined"); }
+    return n;
+  }
 
   node_ptr parse_term() {
     depth_guard guard(*this);
@@ -380,7 +713,7 @@ struct parser_t {
     case T::Dot: {
       p++;
       if (is_punct("[")) { return parse_bracket_suffix(nullptr); }
-      if (peek().t == T::Str) {  // ."foo" when lexed separately
+      if (peek().t == T::Str && peek().parts.empty()) {  // ."foo" when lexed separately
         auto n = std::make_unique<field_node>();
         n->name = toks[p++].s;
         return n;
@@ -401,22 +734,41 @@ struct parser_t {
       return n;
     }
     case T::Str: {
-      auto n = std::make_unique<literal_node>();
-      n->v = value::string(tk.s);
-      p++;
-      return n;
+      const token &s = toks[p++];
+      return string_term(s, "text");
     }
     case T::Var: {
-      if (tk.s == "__loc__") { fail("$__loc__ unsupported"); }
+      if (tk.s == "__loc__") {
+        auto n = std::make_unique<literal_node>();
+        n->v = value::object({{"file", value::string("<top-level>")}, {"line", value::number(tk.line)}});
+        p++;
+        return n;
+      }
+      if (tk.s == "ENV" && !in_scope("ENV")) {
+        p++;
+        return make_call("env", {});
+      }
+      check_var(tk.s);
       auto n = std::make_unique<var_node>();
       n->name = tk.s;
       p++;
       return n;
     }
     case T::Format: {
-      if (tk.s == "json") { p++; auto n = std::make_unique<call_node>(); n->name = "tojson"; return n; }
-      if (tk.s == "text") { p++; auto n = std::make_unique<call_node>(); n->name = "tostring"; return n; }
-      fail("unsupported format @" + tk.s);
+      std::string fmt = tk.s;
+      p++;
+      if (peek().t == T::Str) {
+        const token &s = toks[p++];
+        if (s.parts.empty()) {
+          auto n = std::make_unique<literal_node>();
+          n->v = value::string(s.s);
+          return n;
+        }
+        return string_term(s, fmt);
+      }
+      auto n = std::make_unique<format_node>();
+      n->format = fmt;
+      return n;
     }
     case T::Keyword: {
       if (tk.s == "if") {
@@ -443,24 +795,31 @@ struct parser_t {
       if (tk.s == "reduce" || tk.s == "foreach") {
         bool is_reduce = tk.s == "reduce";
         p++;
-        node_ptr source = parse_postfix();
+        // As in jq 1.8, the source is an expression: reduce .[] / .[] as $x.
+        node_ptr source = parse_alt();
         expect_kw("as");
-        if (peek().t != T::Var) { fail("expected variable"); }
-        std::string name = toks[p++].s;
+        pattern pat;
+        size_t mark = scope.size();
+        parse_pattern(pat);
+        // The pattern's variables are not in scope in the initial value.
+        std::vector<std::string> bound(scope.begin() + std::ptrdiff_t(mark), scope.end());
+        scope.resize(mark);
         expect_punct("(");
         node_ptr init = parse_pipe();
         expect_punct(";");
+        scope.insert(scope.end(), bound.begin(), bound.end());
         node_ptr update = parse_pipe();
         node_ptr extract;
         if (!is_reduce && is_punct(";")) { p++; extract = parse_pipe(); }
+        scope.resize(mark);
         expect_punct(")");
         if (is_reduce) {
           auto n = std::make_unique<reduce_node>();
-          n->source = std::move(source); n->init = std::move(init); n->update = std::move(update); n->name = name;
+          n->source = std::move(source); n->init = std::move(init); n->update = std::move(update); n->pat = std::move(pat);
           return n;
         }
         auto n = std::make_unique<foreach_node>();
-        n->source = std::move(source); n->init = std::move(init); n->update = std::move(update); n->extract = std::move(extract); n->name = name;
+        n->source = std::move(source); n->init = std::move(init); n->update = std::move(update); n->extract = std::move(extract); n->pat = std::move(pat);
         return n;
       }
       if (tk.s == "try") {
@@ -470,6 +829,15 @@ struct parser_t {
         if (is_kw("catch")) { p++; n->handler = parse_postfix(); }
         return n;
       }
+      if (tk.s == "def") {
+        // A definition inside a term: (def f: 1; f).
+        size_t mark = scope.size();
+        auto n = parse_def();
+        n->rest = parse_pipe();
+        scope.resize(mark);
+        return n;
+      }
+      if (tk.s == "import" || tk.s == "include") { fail("modules are not supported"); }
       fail("unexpected keyword " + tk.s);
     }
     case T::Ident: {
@@ -483,28 +851,28 @@ struct parser_t {
             struct break_node : node {
               int id{0};
               void eval(const value &, const env_ptr &, emit_ref) const override { throw break_signal{id}; }
+              void paths(const value &, path_t &, const env_ptr &, emit_ref) const override { throw break_signal{id}; }
             };
             auto n = std::make_unique<break_node>();
             n->id = it->second;
             return n;
           }
         }
-        fail("$*label-" + l + " is not defined");
+        fail_plain("$*label-" + l + " is not defined");
       }
       if ((name == "true" || name == "false" || name == "null") && !is_punct("(")) {
         auto lit = std::make_unique<literal_node>();
         lit->v = name == "null" ? value::null() : value::boolean(name == "true");
         return lit;
       }
-      auto n = std::make_unique<call_node>();
-      n->name = name;
+      std::vector<node_ptr> args;
       if (is_punct("(")) {
         p++;
-        n->args.push_back(parse_pipe());
-        while (is_punct(";")) { p++; n->args.push_back(parse_pipe()); }
+        args.push_back(parse_pipe());
+        while (is_punct(";")) { p++; args.push_back(parse_pipe()); }
         expect_punct(")");
       }
-      return n;
+      return make_call(name, std::move(args));
     }
     case T::Punct: {
       if (tk.s == "(") {
@@ -530,19 +898,51 @@ struct parser_t {
           std::string kname;
           bool simple = false;
           if (k.t == T::Ident || k.t == T::Keyword) { kname = k.s; simple = true; p++; }
-          else if (k.t == T::Str) { kname = k.s; simple = true; p++; }
-          else if (k.t == T::Var) {
+          else if (k.t == T::Str && k.parts.empty()) { kname = k.s; simple = true; p++; }
+          else if (k.t == T::Str) {
+            const token &s = toks[p++];
+            key = string_term(s, "text");
+          } else if (k.t == T::Var && toks[p + 1].t == T::Punct && toks[p + 1].s == ":") {
+            // {$x: v}: the key is the value of $x.
+            p++;
+            if (k.s == "__loc__") {
+              auto lk = std::make_unique<literal_node>();
+              lk->v = value::object({{"file", value::string("<top-level>")}, {"line", value::number(k.line)}});
+              key = std::move(lk);
+            } else {
+              check_var(k.s);
+              auto vv = std::make_unique<var_node>();
+              vv->name = k.s;
+              key = std::move(vv);
+            }
+          } else if (k.t == T::Var) {
             p++;
             auto lk = std::make_unique<literal_node>();
-            lk->v = value::string(k.s);
-            auto vv = std::make_unique<var_node>();
-            vv->name = k.s;
+            if (k.s == "__loc__") {
+              lk->v = value::string("__loc__");
+              auto lv = std::make_unique<literal_node>();
+              lv->v = value::object({{"file", value::string("<top-level>")}, {"line", value::number(k.line)}});
+              val = std::move(lv);
+            } else {
+              check_var(k.s);
+              lk->v = value::string(k.s);
+              auto vv = std::make_unique<var_node>();
+              vv->name = k.s;
+              val = std::move(vv);
+            }
             key = std::move(lk);
-            val = std::move(vv);
+          } else if (k.t == T::Format && toks[p + 1].t == T::Str) {
+            std::string fmt = k.s;
+            p++;
+            const token &s = toks[p++];
+            key = string_term(s, fmt);
+          } else if (k.t == T::Num) {
+            fail("object keys must be strings");
           } else if (is_punct("(")) {
             p++;
             key = parse_pipe();
             expect_punct(")");
+            check_const_key(key.get());
           } else {
             fail("bad object key");
           }
@@ -555,10 +955,13 @@ struct parser_t {
             p++;
             val = parse_obj_value();
           } else if (!val) {
-            if (!simple) { fail("object key needs a value"); }
-            auto f = std::make_unique<field_node>();
-            f->name = kname;
-            val = std::move(f);
+            if (simple) {
+              auto f = std::make_unique<field_node>();
+              f->name = kname;
+              val = std::move(f);
+            } else if (!dynamic_cast<string_node *>(key.get())) {
+              fail("object key needs a value");
+            }
           }
           n->entries.emplace_back(std::move(key), std::move(val));
           if (is_punct(",")) { p++; continue; }
@@ -566,6 +969,10 @@ struct parser_t {
         }
         p++;
         return n;
+      }
+      if (tk.s == "-") {
+        // Unary minus on a term, inside a larger expression: 1 - -1.
+        return parse_unary();
       }
       fail("unexpected '" + tk.s + "'");
     }
@@ -587,14 +994,52 @@ struct parser_t {
   }
 };
 
-node_ptr compile(const std::string &src) {
+extern const char *const PRELUDE;
+
+// The prelude: builtins written in jq, parsed once. Each top-level definition
+// gets a frame whose parent is the previous one, so that the bodies see the
+// definitions before them (and themselves).
+static const prelude_table &prelude_functions() {
+  static prelude_table table;
+  static std::vector<std::unique_ptr<def_node>> defs;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    lexer lx{};
+    lx.src = PRELUDE;
+    lx.run();
+    parser_t ps{};
+    ps.toks = std::move(lx.toks);
+    ps.prelude = &table;
+    env_ptr last{};
+    while (ps.peek().t != T::End) {
+      auto d = ps.parse_def();
+      ps.scope.clear();
+      env_ptr f = d->frame(last);
+      table[d->key] = f;
+      last = f;
+      defs.push_back(std::move(d));
+    }
+  });
+  return table;
+}
+
+std::vector<std::string> prelude_names() {
+  std::vector<std::string> r;
+  for (const auto &kv : prelude_functions()) { r.push_back(kv.first); }
+  return r;
+}
+
+node_ptr compile(const std::string &src, const std::vector<std::string> &globals, compile_info *info) {
   lexer lx{};
   lx.src = src;
   lx.run();
   parser_t ps{};
   ps.toks = std::move(lx.toks);
+  ps.globals = globals;
+  ps.prelude = &prelude_functions();
   node_ptr n = ps.parse_pipe();
   if (ps.peek().t != T::End) { ps.fail("unexpected token"); }
+  if (info) { *info = ps.info; }
   return n;
 }
 

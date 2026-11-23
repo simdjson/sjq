@@ -35,7 +35,7 @@ static od_cond_ptr od_compile_cond(const node *n) {
   }
   if (auto p = dynamic_cast<const pipe_node *>(n)) {
     auto call = dynamic_cast<const call_node *>(p->b.get());
-    if (call && call->name == "not" && call->args.empty()) {
+    if (call && call->is_builtin("not", 0)) {
       auto x = std::make_unique<od_not>();
       x->a = od_compile_cond(p->a.get());
       if (!x->a) { return nullptr; }
@@ -43,21 +43,21 @@ static od_cond_ptr od_compile_cond(const node *n) {
     }
   }
   if (auto call = dynamic_cast<const call_node *>(n)) {
-    if (call->name == "not" && call->args.empty()) {
+    if (call->is_builtin("not", 0)) {
       auto x = std::make_unique<od_not>();
       auto t = std::make_unique<od_truthy>();
       t->path = std::make_unique<od_identity>();
       x->a = std::move(t);
       return x;
     }
-    if (call->name == "has" && call->args.size() == 1) {
+    if (call->is_builtin("has", 1)) {
       auto lit = dynamic_cast<const literal_node *>(call->args[0].get());
       if (!lit || lit->v.k != K::Str) { return nullptr; }
       auto h = std::make_unique<od_has>();
       h->key = std::string(get_str(lit->v));
       return h;
     }
-    if ((call->name == "true" || call->name == "false") && call->args.empty()) {
+    if (call->is_builtin("true", 0) || call->is_builtin("false", 0)) {
       auto c = std::make_unique<od_const>();
       c->v = call->name == "true";
       return c;
@@ -142,14 +142,14 @@ od_ptr od_compile(const node *n) {
     return r;
   }
   if (auto call = dynamic_cast<const call_node *>(n)) {
-    if (call->name == "select" && call->args.size() == 1) {
+    if (call->is_builtin("select", 1)) {
       auto s = std::make_unique<od_select>();
       s->cond = od_compile_cond(call->args[0].get());
       if (!s->cond) { return nullptr; }
       return s;
     }
-    if (call->name == "length" && call->args.empty()) { return std::make_unique<od_length>(); }
-    if (call->name == "empty" && call->args.empty()) { return std::make_unique<od_empty>(); }
+    if (call->is_builtin("length", 0)) { return std::make_unique<od_length>(); }
+    if (call->is_builtin("empty", 0)) { return std::make_unique<od_empty>(); }
     return nullptr;
   }
   if (auto lit = dynamic_cast<const literal_node *>(n)) {

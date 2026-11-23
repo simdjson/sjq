@@ -29,9 +29,13 @@ struct writer {
   bool sort_keys{false};
   bool to_memory{false};
   bool color{false};
+  bool ascii{false};  // -a: non-ASCII characters as \uXXXX escapes
   const std::string *colors{nullptr};  // C_COUNT escape sequences when color is on
 
   writer() { buf.reserve(1 << 20); }
+  // A writer for short strings (tojson, tostring).
+  struct small_tag {};
+  explicit writer(small_tag) {}
   writer(const writer &) = delete;
   writer &operator=(const writer &) = delete;
   void copy_format(const writer &o) {
@@ -40,6 +44,7 @@ struct writer {
     tab = o.tab;
     sort_keys = o.sort_keys;
     color = o.color;
+    ascii = o.ascii;
     colors = o.colors;
   }
   void flush() {
@@ -77,7 +82,52 @@ struct writer {
 
   static inline bool needs_escape(uint8_t c) { return c < 0x20 || c == '"' || c == '\\' || c == 0x7f; }
 
+  // -a: escapes every character outside ASCII, with surrogate pairs.
+  void write_string_ascii(std::string_view s) {
+    buf.push_back('"');
+    for (size_t i = 0; i < s.size();) {
+      uint8_t c = uint8_t(s[i]);
+      if (c < 0x80) {
+        if (needs_escape(c)) { escape_byte(c); } else { buf.push_back(char(c)); }
+        i++;
+        continue;
+      }
+      int len = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2);
+      uint32_t cp = c & (len == 4 ? 0x07 : (len == 3 ? 0x0F : 0x1F));
+      for (int k = 1; k < len && i + size_t(k) < s.size(); k++) { cp = (cp << 6) | (uint8_t(s[i + size_t(k)]) & 0x3F); }
+      i += size_t(len);
+      char tmp[13];
+      if (cp >= 0x10000) {
+        cp -= 0x10000;
+        snprintf(tmp, sizeof(tmp), "\\u%04x\\u%04x", unsigned(0xD800 + (cp >> 10)), unsigned(0xDC00 + (cp & 0x3FF)));
+        put(std::string_view(tmp, 12));
+      } else {
+        snprintf(tmp, sizeof(tmp), "\\u%04x", unsigned(cp));
+        put(std::string_view(tmp, 6));
+      }
+    }
+    buf.push_back('"');
+  }
+
+  void escape_byte(uint8_t c) {
+    switch (c) {
+    case '"': put("\\\""); break;
+    case '\\': put("\\\\"); break;
+    case '\n': put("\\n"); break;
+    case '\t': put("\\t"); break;
+    case '\r': put("\\r"); break;
+    case '\b': put("\\b"); break;
+    case '\f': put("\\f"); break;
+    default: {
+      char tmp[7];
+      snprintf(tmp, sizeof(tmp), "\\u%04x", c);
+      put(std::string_view(tmp, 6));
+    }
+    }
+  }
+
   void write_string(std::string_view s) {
+    if (ascii) { write_string_ascii(s); return; }
     buf.push_back('"');
     const char *p = s.data();
     const char *end = p + s.size();
@@ -328,7 +378,7 @@ struct writer {
 };
 
 inline std::string to_json(const value &v) {
-  writer w{};
+  writer w{writer::small_tag{}};
   w.pretty = false;
   w.write_value(v, 0);
   return std::move(w.buf);

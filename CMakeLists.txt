@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(sjq
+  VERSION 0.1.0
   DESCRIPTION "A jq-compatible command-line JSON processor built on simdjson"
   LANGUAGES CXX
 )
@@ -23,6 +24,7 @@ else()
   FetchContent_Declare(simdjson
     URL https://github.com/simdjson/simdjson/archive/refs/tags/v5.3.0.tar.gz
     URL_HASH SHA256=5e59df8bd3fa760937e6a2ca68193399c85b52b5042716700b149a734737dced
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
   )
   set(SIMDJSON_DEVELOPER_MODE OFF CACHE BOOL "" FORCE)
   set(SIMDJSON_EXCEPTIONS ON CACHE BOOL "" FORCE)
@@ -45,6 +47,7 @@ add_library(sjq-core STATIC
   src/input.cpp
   src/ondemand.cpp
   src/parser.cpp
+  src/text.cpp
 )
 target_compile_features(sjq-core PUBLIC cxx_std_17)
 target_include_directories(sjq-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -68,6 +71,7 @@ target_link_libraries(sjq-core PRIVATE sjq-warnings)
 
 add_executable(sjq src/sjq.cpp)
 target_link_libraries(sjq PRIVATE sjq-core sjq-warnings)
+target_compile_definitions(sjq PRIVATE SJQ_VERSION="${PROJECT_VERSION}")
 
 if(WIN32)
   # Map input files with simdjson::padded_memory_map, which needs Windows 10
