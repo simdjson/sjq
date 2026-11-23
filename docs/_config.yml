@@ -1,0 +1,6 @@
+title: sjq
+description: A fast, jq-compatible command-line JSON processor built on simdjson
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false

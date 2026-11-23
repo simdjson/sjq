@@ -1,0 +1,125 @@
+name: Release
+
+# Builds the binaries and attaches them to the GitHub release of a tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+# simdjson picks its SIMD kernel at run time, so one binary per system and
+# architecture runs at full speed on any processor.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, os: ubuntu-24.04}
+          - {arch: aarch64, os: ubuntu-24.04-arm}
+    # musl: a fully static binary that runs on any Linux distribution.
+    container: alpine:3.22
+    steps:
+      - name: Install the tools
+        run: apk add --no-cache build-base cmake python3 tar
+      - uses: actions/checkout@v6
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          strip build/sjq
+          file build/sjq || true
+          mkdir -p dist/sjq-linux-${{ matrix.arch }}
+          cp build/sjq README.md LICENSE LICENSE-MIT dist/sjq-linux-${{ matrix.arch }}/
+          tar -C dist -czf sjq-linux-${{ matrix.arch }}.tar.gz sjq-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sjq-linux-${{ matrix.arch }}
+          path: sjq-linux-${{ matrix.arch }}.tar.gz
+
+  macos:
+    name: macos-universal
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          strip build/sjq
+          lipo -info build/sjq
+          mkdir -p dist/sjq-macos-universal
+          cp build/sjq README.md LICENSE LICENSE-MIT dist/sjq-macos-universal/
+          tar -C dist -czf sjq-macos-universal.tar.gz sjq-macos-universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sjq-macos-universal
+          path: sjq-macos-universal.tar.gz
+
+  windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, os: windows-2025, cmake_arch: x64}
+          - {arch: arm64, os: windows-11-arm, cmake_arch: ARM64}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        run: |
+          cmake -A ${{ matrix.cmake_arch }} -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -B build
+          cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "dist/sjq-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item build/Release/sjq.exe, README.md, LICENSE, LICENSE-MIT $dir
+          Compress-Archive -Path "$dir/*" -DestinationPath "sjq-windows-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sjq-windows-${{ matrix.arch }}
+          path: sjq-windows-${{ matrix.arch }}.zip
+
+  publish:
+    name: publish
+    needs: [linux, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* install.sh install.ps1 \
+            --title "sjq ${GITHUB_REF_NAME#v}" --generate-notes

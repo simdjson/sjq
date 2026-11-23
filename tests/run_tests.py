@@ -41,6 +41,8 @@ def run(argv, stdin=b"", env=None, timeout=TIMEOUT):
     full_env = dict(os.environ)
     full_env.pop("NO_COLOR", None)
     full_env.pop("JQ_COLORS", None)
+    # jq's tests read $ENV.PAGER; jq's own test harness sets it so.
+    full_env["PAGER"] = "less"
     if env:
         full_env.update(env)
     try:

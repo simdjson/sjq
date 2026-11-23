@@ -1,0 +1,14 @@
+# Benchmarks
+
+    python3 bench/make_data.py DATA --mb 1024      # tweets.ndjson, timeline.json
+    bench/run_bench.sh DATA RESULTS /path/to/jq build/sjq /path/to/hyperfine
+    python3 bench/plot.py RESULTS docs --machine "..."
+
+`probe.sh` runs each workload once and checks that jq and sjq print the same
+output. `plot.py` writes the charts (`docs/bench-*.svg`, light and dark) and
+the table (`docs/_includes/results.md`) used by the README and the
+documentation.
+
+The published numbers were measured on a dual Intel Xeon Gold 6548N (64
+cores, Linux, GCC 16.2), with jq 1.8.2's official static binary and
+hyperfine 2.0.
