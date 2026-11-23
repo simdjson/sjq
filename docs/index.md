@@ -29,9 +29,11 @@ curl -fsSL https://raw.githubusercontent.com/simdjson/sjq/main/install.sh | sh
 The script downloads the binary for your system from the latest
 [release](https://github.com/simdjson/sjq/releases), checks its SHA-256
 checksum and installs it in `~/.local/bin` (set `SJQ_INSTALL_DIR` to choose
-another directory, `SJQ_VERSION` to pick a release). The Linux binaries are
-static: they run on any distribution, x86-64 or ARM64. The macOS binary runs
-on Apple silicon and Intel Macs.
+another directory, `SJQ_VERSION` to pick a release). If that directory is
+not in your `PATH`, it prints the line to add to your shell's startup file
+(`~/.zshrc`, `~/.bashrc`, ...); with `SJQ_MODIFY_PATH=1` it adds the line
+itself. The Linux binaries are static: they run on any distribution, x86-64
+or ARM64. The macOS binary runs on Apple silicon and Intel Macs.
 
 **Windows** (PowerShell):
 
@@ -40,8 +42,16 @@ irm https://raw.githubusercontent.com/simdjson/sjq/main/install.ps1 | iex
 ```
 
 It installs `sjq.exe` in `%LOCALAPPDATA%\Programs\sjq` and adds that
-directory to your user `PATH`. You can also download the zip files from the
-releases page.
+directory to your user `PATH` (and to the current window). You can also
+download the zip files from the releases page.
+
+**With a package manager:**
+
+```
+brew install simdjson/tap/sjq                          # Homebrew (macOS, Linux)
+scoop bucket add sjq https://github.com/simdjson/sjq   # Scoop (Windows)
+scoop install sjq/sjq
+```
 
 **From source** (CMake 3.15 or later, a C++17 compiler):
 

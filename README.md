@@ -27,6 +27,14 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/simdjson/sjq/main/install.ps1 | iex
 ```
 
+With a package manager:
+
+```
+brew install simdjson/tap/sjq                          # Homebrew (macOS, Linux)
+scoop bucket add sjq https://github.com/simdjson/sjq   # Scoop (Windows)
+scoop install sjq/sjq
+```
+
 The scripts download the binary for your system from the latest
 [release](https://github.com/simdjson/sjq/releases) and check its SHA-256
 checksum. The Linux binaries are static (x86-64 and ARM64), the macOS binary
@@ -112,6 +120,9 @@ are listed in the [documentation](https://simdjson.github.io/sjq/#language).
   publishes the binaries and `SHA256SUMS`. If GitHub had no macOS runner,
   the release goes out without the macOS binary: run
   `scripts/release-macos.sh v0.1.0` on a Mac to build and attach it.
+  Then `scripts/update_packages.sh v0.1.0` updates the Scoop manifest
+  (`bucket/`) and the Homebrew tap (simdjson/homebrew-tap), and writes the
+  winget manifests for a pull request to microsoft/winget-pkgs.
 
 sjq was first developed in the simdjson repository (simdjson/simdjson#3143).
 

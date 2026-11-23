@@ -126,3 +126,19 @@ jobs:
         run: |
           SJQ_INSTALL_DIR="$RUNNER_TEMP/sjq" sh install.sh
           "$RUNNER_TEMP/sjq/sjq" --version
+  install-scoop:
+    name: install-scoop
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scoop, with this repository as the bucket
+        shell: pwsh
+        run: |
+          iex "& {$(irm get.scoop.sh)} -RunAsAdmin"
+          $env:Path += ";$env:USERPROFILE\scoop\shims"
+          scoop bucket add sjq "$env:GITHUB_WORKSPACE"
+          scoop install sjq/sjq
+          sjq --version
+          '{"a": 1}' | sjq .a

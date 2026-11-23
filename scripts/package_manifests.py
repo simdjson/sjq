@@ -9,6 +9,7 @@ OUT_DIR (default: packaging/) gets:
   winget/simdjson.sjq.*.yaml         the three winget manifests, for a pull
                                      request to microsoft/winget-pkgs
 """
+import json
 import os
 import sys
 import urllib.request
@@ -16,6 +17,8 @@ import urllib.request
 REPO = "simdjson/sjq"
 DESCRIPTION = "A jq-compatible command-line JSON processor built on simdjson"
 HOMEPAGE = "https://simdjson.github.io/sjq/"
+# Homebrew wants a capital letter first and no article.
+HOMEBREW_DESCRIPTION = "JSON processor compatible with jq, built on simdjson"
 
 
 def checksums(tag):
@@ -29,6 +32,12 @@ def checksums(tag):
     return sums
 
 
+def release_date(tag):
+    url = f"https://api.github.com/repos/{REPO}/releases/tags/{tag}"
+    with urllib.request.urlopen(url) as r:
+        return json.load(r)["published_at"][:10]
+
+
 def main():
     tag = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(__file__), "..", "packaging")
@@ -39,24 +48,30 @@ def main():
     os.makedirs(os.path.join(out, "homebrew"), exist_ok=True)
     with open(os.path.join(out, "homebrew", "sjq.rb"), "w") as f:
         f.write(f'''class Sjq < Formula
-  desc "{DESCRIPTION}"
+  desc "{HOMEBREW_DESCRIPTION}"
   homepage "{HOMEPAGE}"
-  version "{version}"
   license any_of: ["Apache-2.0", "MIT"]
 
   on_macos do
-    url "{base}/sjq-macos-universal.tar.gz"
-    sha256 "{sums["sjq-macos-universal.tar.gz"]}"
+    # One universal binary for Apple silicon and Intel.
+    on_arm do
+      url "{base}/sjq-macos-universal.tar.gz"
+      sha256 "{sums["sjq-macos-universal.tar.gz"]}"
+    end
+    on_intel do
+      url "{base}/sjq-macos-universal.tar.gz"
+      sha256 "{sums["sjq-macos-universal.tar.gz"]}"
+    end
   end
 
   on_linux do
-    on_intel do
-      url "{base}/sjq-linux-x86_64.tar.gz"
-      sha256 "{sums["sjq-linux-x86_64.tar.gz"]}"
-    end
     on_arm do
       url "{base}/sjq-linux-aarch64.tar.gz"
       sha256 "{sums["sjq-linux-aarch64.tar.gz"]}"
+    end
+    on_intel do
+      url "{base}/sjq-linux-x86_64.tar.gz"
+      sha256 "{sums["sjq-linux-x86_64.tar.gz"]}"
     end
   end
 
@@ -104,17 +119,23 @@ end
     header = f'''PackageIdentifier: {wid}
 PackageVersion: {version}
 '''
+    def schema(kind):
+        return f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.{kind}1.28.0.schema.json\n\n"
+
     with open(os.path.join(out, "winget", f"{wid}.yaml"), "w") as f:
-        f.write(header + '''DefaultLocale: en-US
+        f.write(schema("version.") + header + '''DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.9.0
+ManifestVersion: 1.28.0
 ''')
     with open(os.path.join(out, "winget", f"{wid}.installer.yaml"), "w") as f:
-        f.write(header + f'''InstallerType: zip
+        f.write(schema("installer.") + header + f'''InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
 - RelativeFilePath: sjq.exe
   PortableCommandAlias: sjq
+Commands:
+- sjq
+ReleaseDate: {release_date(tag)}
 Installers:
 - Architecture: x64
   InstallerUrl: {base}/sjq-windows-x86_64.zip
@@ -123,10 +144,10 @@ Installers:
   InstallerUrl: {base}/sjq-windows-arm64.zip
   InstallerSha256: {sums["sjq-windows-arm64.zip"].upper()}
 ManifestType: installer
-ManifestVersion: 1.9.0
+ManifestVersion: 1.28.0
 ''')
     with open(os.path.join(out, "winget", f"{wid}.locale.en-US.yaml"), "w") as f:
-        f.write(header + f'''PackageLocale: en-US
+        f.write(schema("defaultLocale.") + header + f'''PackageLocale: en-US
 Publisher: simdjson
 PublisherUrl: https://github.com/simdjson
 PackageName: sjq
@@ -143,7 +164,7 @@ Tags:
 - simdjson
 ReleaseNotesUrl: https://github.com/{REPO}/releases/tag/{tag}
 ManifestType: defaultLocale
-ManifestVersion: 1.9.0
+ManifestVersion: 1.28.0
 ''')
     print(f"wrote the manifests of {tag} in {os.path.abspath(out)}")
 
