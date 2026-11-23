@@ -96,17 +96,22 @@ struct writer {
       uint32_t cp = c & (len == 4 ? 0x07 : (len == 3 ? 0x0F : 0x1F));
       for (int k = 1; k < len && i + size_t(k) < s.size(); k++) { cp = (cp << 6) | (uint8_t(s[i + size_t(k)]) & 0x3F); }
       i += size_t(len);
-      char tmp[13];
       if (cp >= 0x10000) {
         cp -= 0x10000;
-        snprintf(tmp, sizeof(tmp), "\\u%04x\\u%04x", unsigned(0xD800 + (cp >> 10)), unsigned(0xDC00 + (cp & 0x3FF)));
-        put(std::string_view(tmp, 12));
+        put_u16_escape(0xD800 + (cp >> 10));
+        put_u16_escape(0xDC00 + (cp & 0x3FF));
       } else {
-        snprintf(tmp, sizeof(tmp), "\\u%04x", unsigned(cp));
-        put(std::string_view(tmp, 6));
+        put_u16_escape(cp);
       }
     }
     buf.push_back('"');
+  }
+
+  // \uXXXX with lowercase hex digits, as jq writes them.
+  void put_u16_escape(uint32_t u) {
+    static const char hex[] = "0123456789abcdef";
+    char tmp[6] = {'\\', 'u', hex[(u >> 12) & 0xF], hex[(u >> 8) & 0xF], hex[(u >> 4) & 0xF], hex[u & 0xF]};
+    put(std::string_view(tmp, 6));
   }
 
   void escape_byte(uint8_t c) {

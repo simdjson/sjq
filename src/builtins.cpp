@@ -217,64 +217,75 @@ static void grew(heap &h, const value &child) {
   check_depth(h.depth);
 }
 
-void set_path(value &t, const path_t &p, size_t i, const value &v) {
-  if (i == 0) { check_path_depth(p); }
+// Iterative: paths can be as deep as values (10,000 levels), more than the
+// stack allows with sanitizers when each level is a call.
+void set_path(value &t, const path_t &p, size_t from, const value &v) {
+  if (from == 0) { check_path_depth(p); }
   check_stack();
-  if (i == p.size()) { t = v; return; }
-  const value &k = p[i];
-  if (t.k == K::Str && k.k == K::Obj) { throw jq_error("Cannot update string slices"); }
-  if (k.k != K::Str && k.k != K::Num && k.k != K::Obj) {
-    throw jq_error(std::string("Cannot update field at ") + kind_name(k.k) + " index of " + kind_name(t.k));
-  }
-  if (t.k == K::Null) {
-    if (k.k == K::Str) { t = value::object({}); }
-    else if (k.k == K::Num || k.k == K::Obj) { t = value::array({}); }
-    else { cannot_index(t, k); }
-  }
-  if (k.k == K::Str) {
-    if (t.k != K::Obj) { cannot_index(t, k); }
-    heap &h = own(t);
-    std::string_view key = get_str(k);
-    auto it = std::find_if(h.o.begin(), h.o.end(), [&](const auto &kv) { return kv.first == key; });
-    if (it == h.o.end()) {
-      h.o.emplace_back(std::string(key), value::null());
-      it = h.o.end() - 1;
+  // The containers along the path and their child on the path, to update
+  // their recorded depth once the value is in place.
+  std::vector<std::pair<heap *, value *>> chain;
+  value *cur = &t;
+  auto fix_depths = [&]() {
+    for (size_t j = chain.size(); j-- > 0;) { grew(*chain[j].first, *chain[j].second); }
+  };
+  for (size_t i = from; i < p.size(); i++) {
+    const value &k = p[i];
+    value &c = *cur;
+    if (c.k == K::Str && k.k == K::Obj) { throw jq_error("Cannot update string slices"); }
+    if (k.k != K::Str && k.k != K::Num && k.k != K::Obj) {
+      throw jq_error(std::string("Cannot update field at ") + kind_name(k.k) + " index of " + kind_name(c.k));
     }
-    set_path(it->second, p, i + 1, v);
-    grew(h, it->second);
-    return;
-  }
-  if (k.k == K::Num) {
-    if (t.k != K::Arr) { cannot_index(t, k); }
-    double d = get_num(k);
-    if (std::isnan(d)) { throw jq_error("Cannot set array element at NaN index"); }
-    heap &h = own(t);
-    int64_t idx = to_int64(std::floor(d));
-    if (idx < 0) { idx += int64_t(h.a.size()); }
-    if (idx < 0) { throw jq_error("Out of bounds negative array index"); }
-    if (idx >= (int64_t(1) << 29)) { throw jq_error("Array index too large"); }
-    if (size_t(idx) >= h.a.size()) { h.a.resize(size_t(idx) + 1); }
-    set_path(h.a[size_t(idx)], p, i + 1, v);
-    grew(h, h.a[size_t(idx)]);
-    return;
-  }
-  if (k.k == K::Obj) {
-    if (t.k != K::Arr) { throw jq_error(std::string("Cannot update field at object index of ") + kind_name(t.k)); }
+    if (c.k == K::Null) {
+      if (k.k == K::Str) { c = value::object({}); } else { c = value::array({}); }
+    }
+    if (k.k == K::Str) {
+      if (c.k != K::Obj) { cannot_index(c, k); }
+      heap &h = own(c);
+      std::string_view key = get_str(k);
+      auto it = std::find_if(h.o.begin(), h.o.end(), [&](const auto &kv) { return kv.first == key; });
+      if (it == h.o.end()) {
+        h.o.emplace_back(std::string(key), value::null());
+        it = h.o.end() - 1;
+      }
+      chain.emplace_back(&h, &it->second);
+      cur = &it->second;
+      continue;
+    }
+    if (k.k == K::Num) {
+      if (c.k != K::Arr) { cannot_index(c, k); }
+      double d = get_num(k);
+      if (std::isnan(d)) { throw jq_error("Cannot set array element at NaN index"); }
+      heap &h = own(c);
+      int64_t idx = to_int64(std::floor(d));
+      if (idx < 0) { idx += int64_t(h.a.size()); }
+      if (idx < 0) { throw jq_error("Out of bounds negative array index"); }
+      if (idx >= (int64_t(1) << 29)) { throw jq_error("Array index too large"); }
+      if (size_t(idx) >= h.a.size()) { h.a.resize(size_t(idx) + 1); }
+      chain.emplace_back(&h, &h.a[size_t(idx)]);
+      cur = &h.a[size_t(idx)];
+      continue;
+    }
+    // A slice: the rest of the path applies to the slice, which then
+    // replaces its range.
+    if (c.k != K::Arr) { throw jq_error(std::string("Cannot update field at object index of ") + kind_name(c.k)); }
     value a, b;
     slice_of(k, a, b);
     int64_t s = 0, en = 0;
-    slice_bounds(a, b, int64_t(container_size(t)), s, en);
-    value sub = slice_value(t, a, b);
+    slice_bounds(a, b, int64_t(container_size(c)), s, en);
+    value sub = slice_value(c, a, b);
     set_path(sub, p, i + 1, v);
     if (sub.k != K::Arr) { throw jq_error("A slice of an array can only be assigned another array"); }
     std::vector<value> repl = to_vec(sub);
-    heap &h = own(t);
+    heap &h = own(c);
     h.a.erase(h.a.begin() + s, h.a.begin() + en);
     h.a.insert(h.a.begin() + s, repl.begin(), repl.end());
     grew(h, sub);
+    fix_depths();
     return;
   }
-  throw jq_error(std::string("Invalid path component (") + kind_name(k.k) + ")");
+  *cur = v;
+  fix_depths();
 }
 
 static void del_path(value &t, const path_t &p, size_t i) {
@@ -731,11 +742,31 @@ static void join_values(const value &in, const value &sep, emit_ref out) {
   out(value::string(std::move(r)));
 }
 
+// Iterative, for the same reason as set_path.
 static void flatten_into(const value &v, double depth, std::vector<value> &r) {
-  check_stack();
-  each_value(v, [&](const value &x) {
-    if (x.k == K::Arr && depth > 0) { flatten_into(x, depth - 1, r); } else { r.push_back(x); }
-  });
+  struct frame {
+    std::vector<value> items;
+    size_t next;
+    double depth;
+  };
+  std::vector<frame> stack;
+  std::vector<value> top;
+  each_value(v, [&](const value &x) { top.push_back(x); });
+  stack.push_back({std::move(top), 0, depth});
+  while (!stack.empty()) {
+    frame &f = stack.back();
+    if (f.next == f.items.size()) {
+      stack.pop_back();
+      continue;
+    }
+    value x = f.items[f.next++];
+    if (x.k == K::Arr && f.depth > 0) {
+      double d = f.depth - 1;
+      stack.push_back({to_vec(x), 0, d});
+    } else {
+      r.push_back(std::move(x));
+    }
+  }
 }
 
 static void range_gen(double from, double upto, double by, emit_ref out) {
