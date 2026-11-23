@@ -145,7 +145,8 @@ jobs:
         run: |
           iex "& {$(irm get.scoop.sh)} -RunAsAdmin"
           $env:Path += ";$env:USERPROFILE\scoop\shims"
-          scoop bucket add sjq "$env:GITHUB_WORKSPACE"
+          # A bucket is a Git repository: this checkout, by a file URL.
+          scoop bucket add sjq ("file:///" + ($env:GITHUB_WORKSPACE -replace '\\', '/'))
           scoop install sjq/sjq
           sjq --version
           '{"a": 1}' | sjq .a
