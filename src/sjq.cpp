@@ -178,6 +178,29 @@ simdjson_never_inline node_ptr compile_or_report(const std::string &filter, cons
   }
 }
 
+// Filter one document on a worker thread and catch what the filter throws:
+// false (or -1) when it fails, and the main thread redoes the document. With
+// MinGW GCC, an exception caught in the worker, a function defined inside
+// main, crashed the unwinder about half the time (as in compile_or_report).
+simdjson_never_inline bool eval_on_worker(const node &prog, const value &in, const env_ptr &e, emit_ref out) noexcept {
+  try {
+    prog.eval(in, e, out);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// 1: filtered, 0: the document needs the DOM path, -1: the filter failed.
+simdjson_never_inline int od_on_worker(od_expr &plan, ondemand::document_reference &doc, writer &w, bool raw, bool join,
+                                       bool seq) noexcept {
+  try {
+    return od_run_doc(plan, doc, w, raw, join, seq) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
 int main(int argc, char **argv) {
   stack_guard_init(main_stack_budget());
   writer w{};
@@ -764,15 +787,21 @@ int main(int argc, char **argv) {
     return len;
   };
 
-  // Parallel processing: the input is cut into chunks right after newlines
-  // and each worker filters whole chunks into its own buffer; the main thread
-  // writes the buffers in order. A cut inside a document makes the chunk
-  // before it end with an incomplete document (or an error), and so does the
-  // first bad cut, so any failed chunk sends the rest of the input, from that
-  // chunk on, to the sequential path, which also reports errors like jq.
+  // Parallel processing: the input is cut into chunks of 256 KiB to 1 MiB
+  // right after newlines, and each worker filters whole chunks into its own buffer;
+  // the main thread writes the buffers in order. A cut inside a document makes
+  // the chunk before it end with an incomplete document (or an error), and so
+  // does the first bad cut. So the first chunk that fails starts on a document
+  // boundary (the chunks before it ended cleanly), and the documents before
+  // its failure are real: their output is kept, and the sequential path
+  // resumes at the document that failed. It also reports errors like jq.
   // Returns the offset where sequential processing must resume.
   auto run_parallel = [&](const input_source &input) -> size_t {
-    const size_t chunk_target = size_t(1) << 20;
+    // Small chunks balance the work at the end of the input, but each costs
+    // a stream to set up and a buffer to hand over: about eight chunks per
+    // thread, from 256 KiB to 1 MiB.
+    const size_t chunk_target =
+        std::min<size_t>(size_t(1) << 20, std::max<size_t>(size_t(256) << 10, input.size() / (size_t(threads) * 8)));
     std::vector<size_t> starts;
     for (size_t pos = 0; pos < input.size();) {
       starts.push_back(pos);
@@ -785,17 +814,22 @@ int main(int argc, char **argv) {
     const size_t n = starts.size();
     starts.push_back(input.size());
     struct slot {
-      std::string out{};
+      std::string out{};  // when !ok: the output of the documents before the failure
+      size_t resume{0};   // when !ok: where the failing document starts, in the chunk
       bool ok{false};
       bool done{false};
     };
     std::vector<slot> slots(n);
     std::mutex mu;
     std::condition_variable cv_done, cv_window;
-    std::atomic<size_t> next{0};
+    size_t next = 0;           // the next chunk to take (guarded by mu)
+    size_t writer_waits = n;   // the chunk the main thread waits for (guarded by mu)
     std::atomic<bool> abort{false};
     size_t flushed = 0;
-    const size_t window = size_t(threads) * 4;
+    // Starting a worker costs about as much as filtering 512 KiB: at most one
+    // per 512 KiB, and no more than there are chunks.
+    const size_t nthreads = std::min({size_t(threads), n, std::max<size_t>(input.size() >> 19, 1)});
+    const size_t window = nthreads * 4;
     auto worker = [&]() {
       // Worker stacks are small (512 KiB on macOS): deeper values make the
       // chunk fail, and the main thread redoes it.
@@ -814,80 +848,131 @@ int main(int argc, char **argv) {
         else if (!join) { lw.put('\n'); }
       };
       while (true) {
-        size_t k = next.fetch_add(1);
-        if (k >= n) { return; }
+        // A worker waits for room in the window before it takes a chunk, so
+        // that any waiting worker can take the room a written chunk frees:
+        // one is woken, not all of them.
+        size_t k;
         {
           std::unique_lock<std::mutex> lock(mu);
-          cv_window.wait(lock, [&] { return k < flushed + window || abort.load(); });
+          cv_window.wait(lock, [&] { return next >= n || next < flushed + window || abort.load(); });
+          k = next++;
         }
+        if (k >= n) { return; }
         bool ok = !abort.load();
         size_t len = starts[k + 1] - starts[k];
         const uint8_t *cbuf = reinterpret_cast<const uint8_t *>(input.data() + starts[k]);
+        // The document being filtered: where it starts in the chunk, and the
+        // size of the output before it. On a failure, the output is cut back
+        // to that size and the sequential path resumes at that document.
+        size_t keep = 0, keep_out = 0;
         try {
           if (ok && plan) {
             ondemand::document_stream ostream;
             if (local_od.iterate_many(cbuf, len, std::max<size_t>(len, 4096)).get(ostream)) { ok = false; }
             if (ok) {
               for (auto it = ostream.begin(); it != ostream.end(); ++it) {
+                keep = it.current_index();
+                keep_out = lw.buf.size();
                 ondemand::document_reference doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                if (od_run_doc(*plan, doc, lw, raw, join, seq)) { continue; }
+                int od = od_on_worker(*plan, doc, lw, raw, join, seq);
+                if (od == 1) { continue; }
+                if (od < 0) { ok = false; break; }
                 std::string_view src = it.source();
                 dom::element el;
                 if (local_parser.parse(src.data(), src.size(), true).get(el)) { ok = false; break; }
-                prog->eval(value::of(el), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(el), root_env, lemit)) { ok = false; break; }
               }
-              if (ok && ostream.truncated_bytes()) { ok = false; }
+              if (ok && ostream.truncated_bytes()) {
+                ok = false;
+                keep = len - ostream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           } else if (ok) {
             dom::document_stream stream;
             if (local_parser.parse_many(cbuf, len, std::max<size_t>(len, 4096)).get(stream)) { ok = false; }
             if (ok) {
               for (auto it = stream.begin(); it != stream.end(); ++it) {
+                keep = it.current_index();
+                keep_out = lw.buf.size();
                 dom::element doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                prog->eval(value::of(doc), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(doc), root_env, lemit)) { ok = false; break; }
               }
-              if (ok && stream.truncated_bytes()) { ok = false; }
+              if (ok && stream.truncated_bytes()) {
+                ok = false;
+                keep = len - stream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           }
         } catch (...) {
           ok = false;
         }
+        if (!ok) {
+          // A changed input: the sequential path redoes the chunk and reports it.
+          if (g_input_changed.load()) { keep = keep_out = 0; }
+          lw.buf.resize(keep_out);
+        }
         std::string out;
-        if (ok) { out.swap(lw.buf); } else { lw.buf.clear(); }
+        out.swap(lw.buf);
+        bool wake_writer;
         {
           std::lock_guard<std::mutex> lock(mu);
           slots[k].out = std::move(out);
+          slots[k].resume = keep;
           slots[k].ok = ok;
           slots[k].done = true;
+          wake_writer = writer_waits == k;
         }
-        cv_done.notify_all();
+        if (wake_writer) { cv_done.notify_one(); }
       }
     };
     std::vector<std::thread> pool;
-    for (int t = 0; t < threads; t++) { pool.emplace_back(worker); }
+    if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel (%zu threads, %zu chunks)\n", nthreads, n); }
+    for (size_t t = 0; t < nthreads; t++) { pool.emplace_back(worker); }
     size_t resume = input.size();
     for (size_t k = 0; k < n; k++) {
       std::string out;
       bool ok;
+      size_t at;
       {
         std::unique_lock<std::mutex> lock(mu);
+        writer_waits = k;
         cv_done.wait(lock, [&] { return slots[k].done; });
+        writer_waits = n;
         out.swap(slots[k].out);
         ok = slots[k].ok;
+        at = slots[k].resume;
         if (!ok) { abort = true; }
         flushed = k + 1;
       }
-      cv_window.notify_all();
-      if (!ok) { resume = starts[k]; break; }
+      // One more chunk fits in the window; after a failure, all workers stop.
+      if (ok) {
+        cv_window.notify_one();
+      } else {
+        cv_window.notify_all();
+      }
       fwrite(out.data(), 1, out.size(), w.out);
       if (flush_each) { fflush(w.out); }
+      if (!ok) {
+        resume = starts[k] + at;
+        if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: sequential from byte %zu\n", resume); }
+        break;
+      }
     }
+    // Workers still waiting for room see that every chunk is taken (or the
+    // abort) and return.
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      abort = true;
+    }
+    cv_window.notify_all();
     for (auto &t : pool) { t.join(); }
     return resume;
   };
@@ -905,13 +990,13 @@ int main(int argc, char **argv) {
     return stream_format::whitespace_delimited;
   };
 
-  // The parallel path cuts the input after newlines, about every megabyte. A
+  // The parallel path cuts the input after newlines, every 256 KiB or so. A
   // single large document (pretty-printed JSON) makes every chunk fail, and
   // the workers parse them for nothing before the input goes to the
   // sequential path. The first chunk tells: if it does not hold complete
   // documents, the input is not newline-delimited and stays sequential.
   auto first_chunk_is_documents = [&](const input_source &input) {
-    const size_t probe = size_t(1) << 20;
+    const size_t probe = size_t(256) << 10;
     const void *nl = memchr(input.data() + probe, '\n', input.size() - probe);
     if (!nl) { return false; }
     size_t len = size_t(static_cast<const char *>(nl) - input.data()) + 1;
@@ -936,9 +1021,8 @@ int main(int argc, char **argv) {
     line_pos = line_count = doc_end = 0;
     stream_format fmt = input_format(input.data(), input.size());
     size_t offset = 0;
-    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(4) << 20) &&
+    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(1) << 20) &&
         first_chunk_is_documents(input)) {
-      if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel\n"); }
       w.flush();
       offset = run_parallel(input);
       if (offset == input.size()) { status = 0; }
