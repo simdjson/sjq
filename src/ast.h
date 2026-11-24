@@ -604,11 +604,21 @@ struct object_node : node {
         size_t saved = acc.size();
         auto it = std::find_if(acc.begin(), acc.end(), [&](const auto &kv) { return kv.first == key; });
         value prev;
-        bool replaced = false;
-        if (it != acc.end()) { prev = it->second; it->second = v; replaced = true; }
-        else { acc.emplace_back(std::move(key), v); }
+        bool replaced = it != acc.end();
+        // An index, not the iterator: the next entries can grow acc.
+        size_t pos = size_t(it - acc.begin());
+        if (replaced) {
+          prev = acc[pos].second;
+          acc[pos].second = v;
+        } else {
+          acc.emplace_back(std::move(key), v);
+        }
         build(i + 1, acc, in, e, out);
-        if (replaced) { it->second = prev; } else { acc.resize(saved); }
+        if (replaced) {
+          acc[pos].second = prev;
+        } else {
+          acc.resize(saved);
+        }
       });
     });
   }
