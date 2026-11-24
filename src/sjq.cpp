@@ -871,8 +871,13 @@ int main(int argc, char **argv) {
             if (local_od.iterate_many(cbuf, len, std::max<size_t>(len, 4096)).get(ostream)) { ok = false; }
             if (ok) {
               for (auto it = ostream.begin(); it != ostream.end(); ++it) {
-                keep = it.current_index();
-                keep_out = lw.buf.size();
+                // A cut document can print its start (.i of {"i": 5, "a": [1,)
+                // before simdjson reports the error at the same position: the
+                // output before that document stays the mark.
+                if (it.current_index() != keep) {
+                  keep = it.current_index();
+                  keep_out = lw.buf.size();
+                }
                 ondemand::document_reference doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
@@ -896,8 +901,10 @@ int main(int argc, char **argv) {
             if (local_parser.parse_many(cbuf, len, std::max<size_t>(len, 4096)).get(stream)) { ok = false; }
             if (ok) {
               for (auto it = stream.begin(); it != stream.end(); ++it) {
-                keep = it.current_index();
-                keep_out = lw.buf.size();
+                if (it.current_index() != keep) {
+                  keep = it.current_index();
+                  keep_out = lw.buf.size();
+                }
                 dom::element doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }

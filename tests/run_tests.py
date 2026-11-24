@@ -515,6 +515,22 @@ def targeted(sjq, data, tmp):
               f"exit {par_p.returncode}/{seq_p.returncode} {par_err[-200:]!r} {seq_err[-200:]!r}")
         check(f"error mid-stream resumes at the bad document ({filt})",
               f"sjq: sequential from byte {bad_at}\n".encode() in par_all, repr(par_all[-300:]))
+    # A line cut short in the middle: the fast path prints .i from the start
+    # of the cut document before the error is found there. It is printed once,
+    # as with one thread, also when the cut document starts a chunk.
+    for at in (60000, 0):
+        cut = bad[:at] + [b'{"i": %d, "a": [1,' % at] + bad[at + 1:]
+        cut_path = os.path.join(tmp, "cut.ndjson")
+        with open(cut_path, "wb") as f:
+            f.write(b"\n".join(cut))
+        seq_p = subprocess.run([sjq, "--threads", "1", "-c", ".i", cut_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT)
+        for threads in ("2", "4", "16"):
+            par_p = subprocess.run([sjq, "--threads", threads, "-c", ".i", cut_path], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=TIMEOUT)
+            check(f"line cut short at {at}, --threads {threads} as sequential",
+                  par_p.returncode == seq_p.returncode != 0 and par_p.stdout == seq_p.stdout and par_p.stderr == seq_p.stderr,
+                  f"exit {par_p.returncode}/{seq_p.returncode}, {par_p.stdout.count(b'\n')}/{seq_p.stdout.count(b'\n')} lines")
     # A runtime error in the middle: the same as with one thread, resuming at
     # the document that raised it.
     filt = 'if .i == 70000 then error("stop") else .i end'
