@@ -496,6 +496,48 @@ def targeted(sjq, data, tmp):
         f.write(bad_doc)
     code, out, _ = run([sjq, "-c", ".i", bad_path])
     check("error mid-stream", code == 5 and out.count(b"\n") == 60000, f"exit {code}, {out.count(chr(10).encode())} lines")
+    # The parallel path keeps the output of the failing chunk's documents
+    # before the error, and the sequential path resumes at the bad document:
+    # the same output, status and message as with one thread.
+    bad_at = len(b"\n".join(bad[:60000])) + 1
+    for filt in (".i", "{i, n: (.a | add)}"):
+        seq_p = subprocess.run([sjq, "--threads", "1", "-c", filt, bad_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT)
+        par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, bad_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
+        par_err = b"\n".join(l for l in par_p.stderr.split(b"\n") if not l.startswith(b"sjq: parallel")
+                             and not l.startswith(b"sjq: sequential") and not l.endswith(b" path"))
+        check(f"error mid-stream, parallel as sequential ({filt})",
+              par_p.returncode == seq_p.returncode == 5 and par_p.stdout == seq_p.stdout and par_err == seq_p.stderr,
+              f"exit {par_p.returncode}/{seq_p.returncode} {par_err[-200:]!r} {seq_p.stderr[-200:]!r}")
+        check(f"error mid-stream resumes at the bad document ({filt})",
+              f"sjq: sequential from byte {bad_at}\n".encode() in par_p.stderr, repr(par_p.stderr[-300:]))
+    # A runtime error in the middle: the same as with one thread, resuming at
+    # the document that raised it.
+    filt = 'if .i == 70000 then error("stop") else .i end'
+    seq_p = subprocess.run([sjq, "--threads", "1", "-c", filt, nd_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
+    par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, nd_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
+    err_at = len(b"\n".join(nd.split(b"\n")[:70000])) + 1
+    check("runtime error mid-stream, parallel as sequential",
+          par_p.returncode == seq_p.returncode and par_p.stdout == seq_p.stdout and seq_p.stderr in par_p.stderr
+          and f"sjq: sequential from byte {err_at}\n".encode() in par_p.stderr,
+          f"exit {par_p.returncode}/{seq_p.returncode} {par_p.stderr[-300:]!r}")
+
+    # Medium files go parallel too (from 1 MiB), with at most one thread per
+    # 512 KiB; smaller files stay sequential.
+    medium = os.path.join(tmp, "medium.ndjson")
+    with open(medium, "wb") as f:
+        f.write(nd[: nd.index(b"\n", 1536 << 10) + 1])
+    code, out, err = run([sjq, "--threads", "64", "-c", ".i", medium], env={"SJQ_DEBUG": "1"})
+    seq_code, seq_out, _ = run([sjq, "--threads", "1", "-c", ".i", medium])
+    check("medium file goes parallel, with few threads", code == 0 and out == seq_out and b"sjq: parallel (3 threads," in err,
+          f"exit {code} {err!r}")
+    small = os.path.join(tmp, "small.ndjson")
+    with open(small, "wb") as f:
+        f.write(nd[: nd.index(b"\n", 900 << 10) + 1])
+    code, _, err = run([sjq, "-c", ".i", small], env={"SJQ_DEBUG": "1"})
+    check("small file stays sequential", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
     code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"a": [1,')
     check("truncated input", code == 5 and out == b'{"a":1}\n' and b"unclosed array" in err, f"exit {code} {out!r} {err!r}")
 

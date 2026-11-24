@@ -764,15 +764,19 @@ int main(int argc, char **argv) {
     return len;
   };
 
-  // Parallel processing: the input is cut into chunks right after newlines
-  // and each worker filters whole chunks into its own buffer; the main thread
-  // writes the buffers in order. A cut inside a document makes the chunk
-  // before it end with an incomplete document (or an error), and so does the
-  // first bad cut, so any failed chunk sends the rest of the input, from that
-  // chunk on, to the sequential path, which also reports errors like jq.
+  // Parallel processing: the input is cut into chunks of about 256 KiB right
+  // after newlines, and each worker filters whole chunks into its own buffer;
+  // the main thread writes the buffers in order. A cut inside a document makes
+  // the chunk before it end with an incomplete document (or an error), and so
+  // does the first bad cut. So the first chunk that fails starts on a document
+  // boundary (the chunks before it ended cleanly), and the documents before
+  // its failure are real: their output is kept, and the sequential path
+  // resumes at the document that failed. It also reports errors like jq.
   // Returns the offset where sequential processing must resume.
   auto run_parallel = [&](const input_source &input) -> size_t {
-    const size_t chunk_target = size_t(1) << 20;
+    // Small chunks balance the work at the end of the input; 256 KiB keeps
+    // the cost of a chunk (a stream to set up, a buffer to hand over) small.
+    const size_t chunk_target = size_t(256) << 10;
     std::vector<size_t> starts;
     for (size_t pos = 0; pos < input.size();) {
       starts.push_back(pos);
@@ -785,7 +789,8 @@ int main(int argc, char **argv) {
     const size_t n = starts.size();
     starts.push_back(input.size());
     struct slot {
-      std::string out{};
+      std::string out{};  // when !ok: the output of the documents before the failure
+      size_t resume{0};   // when !ok: where the failing document starts, in the chunk
       bool ok{false};
       bool done{false};
     };
@@ -795,7 +800,10 @@ int main(int argc, char **argv) {
     std::atomic<size_t> next{0};
     std::atomic<bool> abort{false};
     size_t flushed = 0;
-    const size_t window = size_t(threads) * 4;
+    // Starting a worker costs about as much as filtering 512 KiB: at most one
+    // per 512 KiB, and no more than there are chunks.
+    const size_t nthreads = std::min({size_t(threads), n, std::max<size_t>(input.size() >> 19, 1)});
+    const size_t window = nthreads * 4;
     auto worker = [&]() {
       // Worker stacks are small (512 KiB on macOS): deeper values make the
       // chunk fail, and the main thread redoes it.
@@ -823,12 +831,18 @@ int main(int argc, char **argv) {
         bool ok = !abort.load();
         size_t len = starts[k + 1] - starts[k];
         const uint8_t *cbuf = reinterpret_cast<const uint8_t *>(input.data() + starts[k]);
+        // The document being filtered: where it starts in the chunk, and the
+        // size of the output before it. On a failure, the output is cut back
+        // to that size and the sequential path resumes at that document.
+        size_t keep = 0, keep_out = 0;
         try {
           if (ok && plan) {
             ondemand::document_stream ostream;
             if (local_od.iterate_many(cbuf, len, std::max<size_t>(len, 4096)).get(ostream)) { ok = false; }
             if (ok) {
               for (auto it = ostream.begin(); it != ostream.end(); ++it) {
+                keep = it.current_index();
+                keep_out = lw.buf.size();
                 ondemand::document_reference doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
@@ -839,30 +853,46 @@ int main(int argc, char **argv) {
                 if (local_parser.parse(src.data(), src.size(), true).get(el)) { ok = false; break; }
                 prog->eval(value::of(el), root_env, lemit);
               }
-              if (ok && ostream.truncated_bytes()) { ok = false; }
+              if (ok && ostream.truncated_bytes()) {
+                ok = false;
+                keep = len - ostream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           } else if (ok) {
             dom::document_stream stream;
             if (local_parser.parse_many(cbuf, len, std::max<size_t>(len, 4096)).get(stream)) { ok = false; }
             if (ok) {
               for (auto it = stream.begin(); it != stream.end(); ++it) {
+                keep = it.current_index();
+                keep_out = lw.buf.size();
                 dom::element doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
                 prog->eval(value::of(doc), root_env, lemit);
               }
-              if (ok && stream.truncated_bytes()) { ok = false; }
+              if (ok && stream.truncated_bytes()) {
+                ok = false;
+                keep = len - stream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           }
         } catch (...) {
           ok = false;
         }
+        if (!ok) {
+          // A changed input: the sequential path redoes the chunk and reports it.
+          if (g_input_changed.load()) { keep = keep_out = 0; }
+          lw.buf.resize(keep_out);
+        }
         std::string out;
-        if (ok) { out.swap(lw.buf); } else { lw.buf.clear(); }
+        out.swap(lw.buf);
         {
           std::lock_guard<std::mutex> lock(mu);
           slots[k].out = std::move(out);
+          slots[k].resume = keep;
           slots[k].ok = ok;
           slots[k].done = true;
         }
@@ -870,23 +900,30 @@ int main(int argc, char **argv) {
       }
     };
     std::vector<std::thread> pool;
-    for (int t = 0; t < threads; t++) { pool.emplace_back(worker); }
+    if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel (%zu threads, %zu chunks)\n", nthreads, n); }
+    for (size_t t = 0; t < nthreads; t++) { pool.emplace_back(worker); }
     size_t resume = input.size();
     for (size_t k = 0; k < n; k++) {
       std::string out;
       bool ok;
+      size_t at;
       {
         std::unique_lock<std::mutex> lock(mu);
         cv_done.wait(lock, [&] { return slots[k].done; });
         out.swap(slots[k].out);
         ok = slots[k].ok;
+        at = slots[k].resume;
         if (!ok) { abort = true; }
         flushed = k + 1;
       }
       cv_window.notify_all();
-      if (!ok) { resume = starts[k]; break; }
       fwrite(out.data(), 1, out.size(), w.out);
       if (flush_each) { fflush(w.out); }
+      if (!ok) {
+        resume = starts[k] + at;
+        if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: sequential from byte %zu\n", resume); }
+        break;
+      }
     }
     for (auto &t : pool) { t.join(); }
     return resume;
@@ -905,13 +942,13 @@ int main(int argc, char **argv) {
     return stream_format::whitespace_delimited;
   };
 
-  // The parallel path cuts the input after newlines, about every megabyte. A
+  // The parallel path cuts the input after newlines, every 256 KiB or so. A
   // single large document (pretty-printed JSON) makes every chunk fail, and
   // the workers parse them for nothing before the input goes to the
   // sequential path. The first chunk tells: if it does not hold complete
   // documents, the input is not newline-delimited and stays sequential.
   auto first_chunk_is_documents = [&](const input_source &input) {
-    const size_t probe = size_t(1) << 20;
+    const size_t probe = size_t(256) << 10;
     const void *nl = memchr(input.data() + probe, '\n', input.size() - probe);
     if (!nl) { return false; }
     size_t len = size_t(static_cast<const char *>(nl) - input.data()) + 1;
@@ -936,9 +973,8 @@ int main(int argc, char **argv) {
     line_pos = line_count = doc_end = 0;
     stream_format fmt = input_format(input.data(), input.size());
     size_t offset = 0;
-    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(4) << 20) &&
+    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(1) << 20) &&
         first_chunk_is_documents(input)) {
-      if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel\n"); }
       w.flush();
       offset = run_parallel(input);
       if (offset == input.size()) { status = 0; }
