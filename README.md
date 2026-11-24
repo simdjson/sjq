@@ -10,8 +10,8 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and on large inputs they run ten to a hundred
-times faster. Documentation: **https://simdjson.github.io/sjq/**
+write for jq work with sjq, and on large inputs they run ten to almost two
+hundred times faster. Documentation: **https://simdjson.github.io/sjq/**
 
 ## Install
 
@@ -25,6 +25,14 @@ Windows (PowerShell):
 
 ```
 irm https://raw.githubusercontent.com/simdjson/sjq/main/install.ps1 | iex
+```
+
+With a package manager:
+
+```
+brew install simdjson/tap/sjq                          # Homebrew (macOS, Linux)
+scoop bucket add sjq https://github.com/simdjson/sjq   # Scoop (Windows)
+scoop install sjq/sjq
 ```
 
 The scripts download the binary for your system from the latest
@@ -42,6 +50,25 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 cmake --install build
 ```
+
+## Windows: quoting
+
+- Command Prompt (cmd): single quotes are not quotes. Use double quotes, with
+  `\"` inside: `sjq "select(.name == \"x\")" file.json`.
+- Windows PowerShell 5 strips the double quotes inside arguments:
+  `'."année"'` reaches sjq as `.année`.
+- In both, put the filter in a file: `sjq -f filter.jq file.json`.
+- PowerShell 5's `>` writes UTF-16: use `sjq -o out.json ...` instead, and
+  sjq writes UTF-8 itself. sjq reads UTF-16 files with a byte order mark.
+
+## Invalid JSON
+
+Filters that only navigate and select (`.a.b`, `select(...)`, `{id, name}`)
+run on simdjson's On-Demand API, which parses only what the filter reads: the
+parts of a document they skip are not fully checked (`sjq .a` prints `1` for
+`{"a": 1, "b": tru}`). Invalid UTF-8, unclosed strings and unbalanced
+brackets are caught everywhere. `--no-od` checks every document in full, as
+jq does.
 
 ## Performance
 
@@ -93,6 +120,12 @@ are listed in the [documentation](https://simdjson.github.io/sjq/#language).
   publishes the binaries and `SHA256SUMS`. If GitHub had no macOS runner,
   the release goes out without the macOS binary: run
   `scripts/release-macos.sh v0.1.0` on a Mac to build and attach it.
+  The package managers follow the latest release once it is complete
+  (all five binaries): the `Packages` workflow updates the Scoop manifest
+  (`bucket/sjq.json`) and keeps the winget manifests as an artifact, and
+  simdjson/homebrew-tap updates its formula. Both run after each release
+  workflow and every six hours; `scripts/update_packages.sh` (called by
+  `release-macos.sh`) runs them right away.
 
 sjq was first developed in the simdjson repository (simdjson/simdjson#3143).
 

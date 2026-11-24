@@ -1,16 +1,19 @@
 // sjq: a jq-compatible JSON processor built on simdjson.
 #include "ast.h"
 #include "builtins.h"
+#include "diagnose.h"
 #include "input.h"
 #include "ondemand.h"
 #include "writer.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -39,6 +42,8 @@ static void usage(FILE *f) {
           "      --tab                 indent with tabs\n"
           "      --indent n            indent with n spaces (-1 to 7; -1 means tabs)\n"
           "  -f, --from-file file      read the filter from a file\n"
+          "  -o, --output file         write the output to a file (UTF-8, LF line ends) at the end\n"
+          "                            of a successful run (it can be an input)\n"
           "      --arg name value      set $name to the string value\n"
           "      --argjson name json   set $name to the JSON value\n"
           "      --slurpfile name file set $name to an array of the JSON values in file\n"
@@ -49,37 +54,66 @@ static void usage(FILE *f) {
           "      --unbuffered          flush after each input\n"
           "  -b, --binary              on Windows, write LF line ends (no CR)\n"
           "      --threads n           worker threads for large files (1: sequential)\n"
-          "      --no-od               do not use the On-Demand fast path\n"
+          "      --no-od               do not use the On-Demand fast path (check all the input)\n"
           "      --no-mmap             read files instead of mapping them\n"
           "  -V, --version\n"
-          "  -h, --help\n");
+          "  -h, --help\n"
+          "\n"
+          "With filters that only select (.a.b, select(...), {a, b}), sjq checks only the parts of the\n"
+          "input it reads; --no-od checks every document in full, as jq does.\n"
+          "On Windows, quoting a filter is hard in cmd and PowerShell 5: put it in a file and use -f FILE.\n"
+          "Documentation: https://simdjson.github.io/sjq/\n");
 }
 
-// Reads a whole file (or standard input for "-"); false when it cannot.
-static bool read_file(const std::string &name, std::string &out) {
+static const char *const UTF16_ADVICE =
+    "the file seems to be in UTF-16 without a byte order mark (Windows PowerShell 5 writes UTF-16 with >): "
+    "save it as UTF-8, or write it with sjq -o FILE";
+
+// Reads a whole file (or standard input for "-"); false when it cannot, with
+// the reason in why. UTF-16 with a byte order mark is converted to UTF-8.
+static bool read_file(const std::string &name, std::string &out, std::string &why) {
   out.clear();
   if (name == "-") {
     char buf[65536];
     while (true) {
       long long r = read_stdin(buf, sizeof(buf));
-      if (r < 0) { return false; }
-      if (r == 0) { return true; }
+      if (r < 0) {
+        why = "cannot read standard input";
+        return false;
+      }
+      if (r == 0) { break; }
       out.append(buf, size_t(r));
     }
+  } else {
+    input_source src;
+    if (!src.load(name, false)) {
+      why = open_failure_reason(name);
+      return false;
+    }
+    out.assign(src.data(), src.size());
   }
-  input_source src;
-  if (!src.load(name, false)) { return false; }
-  out.assign(src.data(), src.size());
+  std::string converted;
+  if (utf16_with_bom_to_utf8(out.data(), out.size(), converted)) {
+    out.swap(converted);
+  } else if (looks_like_utf16(out.data(), out.size())) {
+    why = UTF16_ADVICE;
+    return false;
+  }
   return true;
 }
+
 
 // Parses every JSON value of text as owned values; false on a parse error.
 static bool parse_all(const std::string &text, std::vector<value> &out, std::string &err) {
   dom::parser parser;
   padded_string copy(text);
   dom::document_stream stream;
+  if (looks_like_utf16(text.data(), text.size())) {
+    err = UTF16_ADVICE;
+    return false;
+  }
   if (auto e = parser.parse_many(copy, std::max<size_t>(copy.size(), 1024)).get(stream)) {
-    err = error_message(e);
+    err = describe_json_error(text.data(), text.size(), e);
     return false;
   }
   for (auto it = stream.begin(); it != stream.end(); ++it) {
@@ -87,13 +121,13 @@ static bool parse_all(const std::string &text, std::vector<value> &out, std::str
     auto e = (*it).get(doc);
     if (e == EMPTY) { break; }
     if (e) {
-      err = error_message(e);
+      err = describe_json_error(text.data(), text.size(), e);
       return false;
     }
     out.push_back(to_owned(doc));
   }
   if (stream.truncated_bytes()) {
-    err = "Unfinished JSON term at EOF";
+    err = describe_json_error(text.data(), text.size(), TAPE_ERROR);
     return false;
   }
   return true;
@@ -135,9 +169,35 @@ static void setup_colors(std::string *colors) {
 simdjson_never_inline node_ptr compile_or_report(const std::string &filter, const std::vector<std::string> &globals, compile_info &info) {
   try {
     return compile(filter, globals, &info);
+  } catch (syntax_error &err) {
+    fprintf(stderr, "sjq: error: %s", describe_syntax_error(filter, err).c_str());
+    return nullptr;
   } catch (std::exception &ex) {
     fprintf(stderr, "sjq: error: %s\n", ex.what());
     return nullptr;
+  }
+}
+
+// Filter one document on a worker thread and catch what the filter throws:
+// false (or -1) when it fails, and the main thread redoes the document. With
+// MinGW GCC, an exception caught in the worker, a function defined inside
+// main, crashed the unwinder about half the time (as in compile_or_report).
+simdjson_never_inline bool eval_on_worker(const node &prog, const value &in, const env_ptr &e, emit_ref out) noexcept {
+  try {
+    prog.eval(in, e, out);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// 1: filtered, 0: the document needs the DOM path, -1: the filter failed.
+simdjson_never_inline int od_on_worker(od_expr &plan, ondemand::document_reference &doc, writer &w, bool raw, bool join,
+                                       bool seq) noexcept {
+  try {
+    return od_run_doc(plan, doc, w, raw, join, seq) ? 1 : 0;
+  } catch (...) {
+    return -1;
   }
 }
 
@@ -152,6 +212,7 @@ int main(int argc, char **argv) {
   std::string filter{};
   bool have_filter = false;
   std::string filter_file{};
+  std::string output_file_name{};
   std::vector<std::string> files{};
   // --arg and friends: the variables, in order, and $ARGS.
   std::vector<std::pair<std::string, value>> named{};
@@ -180,7 +241,7 @@ int main(int argc, char **argv) {
         std::vector<value> vs;
         std::string err;
         if (!parse_all(a, vs, err) || vs.size() != 1) {
-          fprintf(stderr, "sjq: invalid JSON text passed to --jsonargs\n");
+          fprintf(stderr, "sjq: invalid JSON text passed to --jsonargs: %s\n", err.empty() ? "one value expected" : err.c_str());
           return 2;
         }
         positional.push_back(vs[0]);
@@ -218,7 +279,7 @@ int main(int argc, char **argv) {
       std::vector<value> vs;
       std::string err;
       if (!parse_all(argv[i + 2], vs, err) || vs.size() != 1) {
-        fprintf(stderr, "sjq: invalid JSON text passed to --argjson\n");
+        fprintf(stderr, "sjq: invalid JSON text passed to --argjson %s: %s\n", argv[i + 1], err.empty() ? "one value expected" : err.c_str());
         return 2;
       }
       set_named(argv[i + 1], vs[0]);
@@ -226,9 +287,9 @@ int main(int argc, char **argv) {
     }
     else if (a == "--slurpfile" || a == "--rawfile") {
       need(i, 2, a);
-      std::string text;
-      if (!read_file(argv[i + 2], text)) {
-        fprintf(stderr, "sjq: error: could not open %s\n", argv[i + 2]);
+      std::string text, why;
+      if (!read_file(argv[i + 2], text, why)) {
+        fprintf(stderr, "sjq: error: could not read %s: %s\n", argv[i + 2], why.c_str());
         return 2;
       }
       if (a == "--rawfile") {
@@ -247,6 +308,7 @@ int main(int argc, char **argv) {
     else if (a == "--args") { rest_mode = 1; }
     else if (a == "--jsonargs") { rest_mode = 2; }
     else if (a == "--fractured") { w.fractured = true; }
+    else if (a == "-o" || a == "--output") { need(i, 1, a); output_file_name = argv[++i]; }
     else if (a == "--width") {
       need(i, 1, a);
       char *endp = nullptr;
@@ -299,10 +361,14 @@ int main(int argc, char **argv) {
     }
   }
   if (!filter_file.empty()) {
-    if (!read_file(filter_file, filter)) {
-      fprintf(stderr, "sjq: error: could not open %s\n", filter_file.c_str());
+    std::string why;
+    if (!read_file(filter_file, filter, why)) {
+      fprintf(stderr, "sjq: error: could not read %s: %s\n", filter_file.c_str(), why.c_str());
       return 2;
     }
+    // Some Windows editors, and PowerShell 5's Out-File -Encoding utf8, start
+    // the file with a byte order mark.
+    if (filter.compare(0, 3, "\xEF\xBB\xBF") == 0) { filter.erase(0, 3); }
     have_filter = true;
   }
   if (!have_filter) { usage(stderr); return 2; }
@@ -313,7 +379,9 @@ int main(int argc, char **argv) {
 
   static std::string colors[C_COUNT];
   const char *no_color = getenv("NO_COLOR");
-  const bool terminal = stdout_is_terminal();
+  // -o FILE: opened once the filter compiles (see below).
+  output_file output{};
+  const bool terminal = output_file_name.empty() && stdout_is_terminal();
   const bool can_color = prepare_console(binary);
   // The FracturedJson layout has no colors.
   w.color = !w.fractured && (color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color)));
@@ -329,6 +397,22 @@ int main(int argc, char **argv) {
   compile_info info{};
   node_ptr prog = compile_or_report(filter, globals, info);
   if (!prog) { return 3; }
+
+  // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
+  // that the shell does not re-encode the output (Windows PowerShell 5's >
+  // writes UTF-16). The output goes to a temporary file that replaces FILE
+  // at the end of a successful run (see output_file): FILE can also be an
+  // input (sjq -o data.json ... data.json), and a failed run leaves it as it
+  // was.
+  if (!output_file_name.empty()) {
+    std::string why = output_problem(output_file_name);
+    if (why.empty()) { open_output(output_file_name, output, why); }
+    if (!why.empty()) {
+      fprintf(stderr, "sjq: error: cannot write %s: %s\n", output_file_name.c_str(), why.c_str());
+      return 2;
+    }
+    w.out = output.f;
+  }
   // The variables of --arg and friends, and $ARGS.
   env_ptr root_env{};
   root_env = push_var("ARGS", value::object({{"positional", value::array(positional)}, {"named", value::object(named)}}), root_env);
@@ -346,6 +430,15 @@ int main(int argc, char **argv) {
   // As jq: an input that cannot be opened, read or parsed makes the exit
   // status 2, whatever happens with the other inputs.
   bool file_error = false;
+  // Any error (a filter that fails, invalid input): unlike status, which
+  // follows jq (the status of the last input), it stays set.
+  bool any_error = false;
+  // As jq: invalid JSON makes the exit status 5, even when later inputs
+  // succeed.
+  bool parse_error = false;
+  // halt and halt_error: the processing stops and sjq ends with this status.
+  bool halted = false;
+  int halt_status = 0;
   int last_output = -1;  // -e: -1 no output, 0 false or null, 1 other
   auto emit = [&](const value &v) {
     if (seq) { w.put('\x1e'); }
@@ -358,9 +451,44 @@ int main(int argc, char **argv) {
   };
   auto final_status = [&](int st) {
     if (file_error) { return 2; }
+    if (parse_error) { return 5; }
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
   };
+  // -o: puts the output in place (keep), or drops it. Returns false when
+  // the file could not be written.
+  auto close_output = [&](bool keep) {
+    if (!output.f) { return true; }
+    if (!keep) {
+      discard_output(output);
+      fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file_name.c_str());
+      return true;
+    }
+    std::string why;
+    if (commit_output(output, why)) { return true; }
+    fprintf(stderr, "sjq: error: could not write %s: %s (it was not changed)\n", output_file_name.c_str(), why.c_str());
+    return false;
+  };
+  // Writes what is left, puts the output in place and returns the exit
+  // status.
+  auto finish = [&](int st) {
+    w.flush();
+    int fs = final_status(st);
+    if (halted) {
+      // As jq: an input that could not be read (2) or parsed (5) wins over
+      // the status of halt.
+      fs = file_error ? 2 : (parse_error ? 5 : halt_status);
+    }
+    bool clean = !any_error && !file_error && !parse_error;
+    // With -e, the statuses 1 and 4 describe the output.
+    bool output_status = fs == 0 || (exit_status && (fs == 1 || fs == 4));
+    if (halted && clean) { output_status = true; }
+    if (!close_output(clean && output_status)) { return 2; }
+    // A dropped -o output is a failure, whatever the last input did.
+    if (!output_file_name.empty() && !clean && output_status) { return 5; }
+    return fs;
+  };
+
   // jq reports the number of lines consumed when an error happens. line_count
   // counts the newlines of the current buffer before line_pos.
   const char *line_base = nullptr;
@@ -390,19 +518,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), err.what());
       }
       status = 5;
+      any_error = true;
     } catch (halt_signal &h) {
       w.flush();
       fputs(h.message.c_str(), stderr);
       fflush(stderr);
-      exit(h.code);
+      // halt and halt_error end the program as asked, with the output so
+      // far: the loops stop, the inputs are released, then main ends.
+      halted = true;
+      halt_status = h.code;
     } catch (break_signal &) {
       w.flush();
       fprintf(stderr, "sjq: error (at %s): break\n", name);
       status = 5;
+      any_error = true;
     } catch (std::exception &ex) {
       w.flush();
       fprintf(stderr, "sjq: error (at %s): %s\n", location(name).c_str(), ex.what());
       status = 5;
+      any_error = true;
     }
   };
 
@@ -422,9 +556,9 @@ int main(int argc, char **argv) {
         const std::string &fname = files[next_file++];
         current_name = fname;
         g_input_filename = fname == "-" ? nullptr : fname.c_str();
-        std::string text;
-        if (!read_file(fname, text)) {
-          fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+        std::string text, why;
+        if (!read_file(fname, text, why)) {
+          fprintf(stderr, "sjq: error: could not read %s: %s\n", fname == "-" ? "<stdin>" : fname.c_str(), why.c_str());
           file_error = true;
           continue;
         }
@@ -461,9 +595,9 @@ int main(int argc, char **argv) {
         if (raw_input) {
           std::string all;
           for (const auto &fname : files) {
-            std::string text;
-            if (!read_file(fname, text)) {
-              fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+            std::string text, why;
+            if (!read_file(fname, text, why)) {
+              fprintf(stderr, "sjq: error: could not read %s: %s\n", fname == "-" ? "<stdin>" : fname.c_str(), why.c_str());
               file_error = true;
               continue;
             }
@@ -494,20 +628,21 @@ int main(int argc, char **argv) {
       run(value::null(), "<unknown>");
     } else {
       value v;
-      while (next_value(v)) {
+      while (!halted && next_value(v)) {
         value in = std::move(v);
         run(in, current_name == "-" ? "<stdin>" : current_name.c_str());
       }
     }
-    if (failed) { status = 2; }
-    w.flush();
-    return final_status(status);
+    if (failed) {
+      status = 2;
+      any_error = true;
+    }
+    return finish(status);
   }
 
   if (null_input) {
     run(value::null(), "<unknown>");
-    w.flush();
-    return final_status(status);
+    return finish(status);
   }
   if (use_mmap) { install_fault_handler(); }
   dom::parser parser{};
@@ -516,7 +651,25 @@ int main(int argc, char **argv) {
   // under sjq from errors in the input.
   const input_source *current = nullptr;
   auto input_changed = [&]() { return current && current->changed(); };
+  // The largest parse batch (at least 1 MB). SJQ_TEST_BATCH (bytes) lowers
+  // it for the tests, so that a small file spans several batches.
+  size_t max_batch = size_t(64) << 20;
+  if (const char *tb = getenv("SJQ_TEST_BATCH")) { max_batch = std::max<size_t>(1, strtoull(tb, nullptr, 10)); }
   bool fatal = false;  // a parse error ends the input, as in jq
+
+  // The message for invalid JSON in data[start, len): where the first problem
+  // is (line and column from the start of the input) and what it is.
+  auto json_error_text = [&](const char *data, size_t len, size_t start, error_code err) {
+    json_problem p = find_json_problem(data + start, len - start);
+    if (!p.found) { return "invalid JSON: " + plain_error(err); }
+    size_t at = start + p.offset;
+    count_lines_to(at);
+    size_t ls = at;
+    while (ls > 0 && data[ls - 1] != '\n') { ls--; }
+    size_t column = 1;
+    for (size_t k = ls; k < at; k++) { column += (static_cast<unsigned char>(data[k]) & 0xC0) != 0x80; }
+    return "invalid JSON at line " + std::to_string(line_count + 1) + ", column " + std::to_string(column) + ": " + p.message;
+  };
 
   // Filters the documents of data[offset, len). When at_eof is false, an
   // incomplete last document is left for later. Returns the offset where
@@ -524,7 +677,7 @@ int main(int argc, char **argv) {
   auto run_sequential = [&](const char *data, size_t len, size_t offset, bool at_eof, stream_format fmt, const char *name) -> size_t {
     // If a document does not fit in a batch, the stream restarts there with a
     // larger batch.
-    size_t batch = std::max<size_t>(size_t(1) << 20, std::min<size_t>(len - offset, size_t(64) << 20));
+    size_t batch = std::max<size_t>(size_t(1) << 20, std::min<size_t>(len - offset, max_batch));
     while (offset < len) {
       size_t slen = len - offset;
       const uint8_t *sbuf = reinterpret_cast<const uint8_t *>(data + offset);
@@ -540,8 +693,10 @@ int main(int argc, char **argv) {
         }
         if (err == EMPTY) { return false; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(err)); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, offset + index, err).c_str()); }
         status = 5;
+        any_error = true;
+        parse_error = true;
         failed = fatal = true;
         return false;
       };
@@ -571,12 +726,18 @@ int main(int argc, char **argv) {
             auto derr = parser.parse(src.data(), src.size(), true).get(el);
             if (derr) {
               w.flush();
-              if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, error_message(derr)); }
+              if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, size_t(src.data() - data), derr).c_str()); }
               status = 5;
+              any_error = true;
+              parse_error = true;
               failed = fatal = true;
               break;
             }
             run(value::of(el), name);
+            if (halted) {
+              failed = fatal = true;
+              break;
+            }
           }
           if (flush_each) { w.flush(); } else { w.maybe_flush(); }
         }
@@ -601,6 +762,10 @@ int main(int argc, char **argv) {
           if (end < len && data[end] == '\n') { end++; }
           doc_end = end;
           run(value::of(doc), name);
+          if (halted) {
+            failed = fatal = true;
+            break;
+          }
           if (flush_each) { w.flush(); } else { w.maybe_flush(); }
         }
         if (!retry && !failed) { truncated = stream.truncated_bytes(); }
@@ -608,8 +773,10 @@ int main(int argc, char **argv) {
       if (truncated) {
         if (!at_eof) { return offset + slen - truncated; }
         w.flush();
-        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): Unfinished JSON term at EOF\n", name); }
+        if (!input_changed()) { fprintf(stderr, "sjq: error (at %s): %s\n", name, json_error_text(data, len, len - truncated, TAPE_ERROR).c_str()); }
         status = 5;
+        any_error = true;
+        parse_error = true;
         fatal = true;
       }
       if (failed) { return len; }
@@ -620,15 +787,21 @@ int main(int argc, char **argv) {
     return len;
   };
 
-  // Parallel processing: the input is cut into chunks right after newlines
-  // and each worker filters whole chunks into its own buffer; the main thread
-  // writes the buffers in order. A cut inside a document makes the chunk
-  // before it end with an incomplete document (or an error), and so does the
-  // first bad cut, so any failed chunk sends the rest of the input, from that
-  // chunk on, to the sequential path, which also reports errors like jq.
+  // Parallel processing: the input is cut into chunks of 256 KiB to 1 MiB
+  // right after newlines, and each worker filters whole chunks into its own buffer;
+  // the main thread writes the buffers in order. A cut inside a document makes
+  // the chunk before it end with an incomplete document (or an error), and so
+  // does the first bad cut. So the first chunk that fails starts on a document
+  // boundary (the chunks before it ended cleanly), and the documents before
+  // its failure are real: their output is kept, and the sequential path
+  // resumes at the document that failed. It also reports errors like jq.
   // Returns the offset where sequential processing must resume.
   auto run_parallel = [&](const input_source &input) -> size_t {
-    const size_t chunk_target = size_t(1) << 20;
+    // Small chunks balance the work at the end of the input, but each costs
+    // a stream to set up and a buffer to hand over: about eight chunks per
+    // thread, from 256 KiB to 1 MiB.
+    const size_t chunk_target =
+        std::min<size_t>(size_t(1) << 20, std::max<size_t>(size_t(256) << 10, input.size() / (size_t(threads) * 8)));
     std::vector<size_t> starts;
     for (size_t pos = 0; pos < input.size();) {
       starts.push_back(pos);
@@ -641,17 +814,22 @@ int main(int argc, char **argv) {
     const size_t n = starts.size();
     starts.push_back(input.size());
     struct slot {
-      std::string out{};
+      std::string out{};  // when !ok: the output of the documents before the failure
+      size_t resume{0};   // when !ok: where the failing document starts, in the chunk
       bool ok{false};
       bool done{false};
     };
     std::vector<slot> slots(n);
     std::mutex mu;
     std::condition_variable cv_done, cv_window;
-    std::atomic<size_t> next{0};
+    size_t next = 0;           // the next chunk to take (guarded by mu)
+    size_t writer_waits = n;   // the chunk the main thread waits for (guarded by mu)
     std::atomic<bool> abort{false};
     size_t flushed = 0;
-    const size_t window = size_t(threads) * 4;
+    // Starting a worker costs about as much as filtering 512 KiB: at most one
+    // per 512 KiB, and no more than there are chunks.
+    const size_t nthreads = std::min({size_t(threads), n, std::max<size_t>(input.size() >> 19, 1)});
+    const size_t window = nthreads * 4;
     auto worker = [&]() {
       // Worker stacks are small (512 KiB on macOS): deeper values make the
       // chunk fail, and the main thread redoes it.
@@ -670,80 +848,138 @@ int main(int argc, char **argv) {
         else if (!join) { lw.put('\n'); }
       };
       while (true) {
-        size_t k = next.fetch_add(1);
-        if (k >= n) { return; }
+        // A worker waits for room in the window before it takes a chunk, so
+        // that any waiting worker can take the room a written chunk frees:
+        // one is woken, not all of them.
+        size_t k;
         {
           std::unique_lock<std::mutex> lock(mu);
-          cv_window.wait(lock, [&] { return k < flushed + window || abort.load(); });
+          cv_window.wait(lock, [&] { return next >= n || next < flushed + window || abort.load(); });
+          k = next++;
         }
+        if (k >= n) { return; }
         bool ok = !abort.load();
         size_t len = starts[k + 1] - starts[k];
         const uint8_t *cbuf = reinterpret_cast<const uint8_t *>(input.data() + starts[k]);
+        // The document being filtered: where it starts in the chunk, and the
+        // size of the output before it. On a failure, the output is cut back
+        // to that size and the sequential path resumes at that document.
+        size_t keep = 0, keep_out = 0;
         try {
           if (ok && plan) {
             ondemand::document_stream ostream;
             if (local_od.iterate_many(cbuf, len, std::max<size_t>(len, 4096)).get(ostream)) { ok = false; }
             if (ok) {
               for (auto it = ostream.begin(); it != ostream.end(); ++it) {
+                // A cut document can print its start (.i of {"i": 5, "a": [1,)
+                // before simdjson reports the error at the same position: the
+                // output before that document stays the mark.
+                if (it.current_index() != keep) {
+                  keep = it.current_index();
+                  keep_out = lw.buf.size();
+                }
                 ondemand::document_reference doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                if (od_run_doc(*plan, doc, lw, raw, join, seq)) { continue; }
+                int od = od_on_worker(*plan, doc, lw, raw, join, seq);
+                if (od == 1) { continue; }
+                if (od < 0) { ok = false; break; }
                 std::string_view src = it.source();
                 dom::element el;
                 if (local_parser.parse(src.data(), src.size(), true).get(el)) { ok = false; break; }
-                prog->eval(value::of(el), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(el), root_env, lemit)) { ok = false; break; }
               }
-              if (ok && ostream.truncated_bytes()) { ok = false; }
+              if (ok && ostream.truncated_bytes()) {
+                ok = false;
+                keep = len - ostream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           } else if (ok) {
             dom::document_stream stream;
             if (local_parser.parse_many(cbuf, len, std::max<size_t>(len, 4096)).get(stream)) { ok = false; }
             if (ok) {
               for (auto it = stream.begin(); it != stream.end(); ++it) {
+                if (it.current_index() != keep) {
+                  keep = it.current_index();
+                  keep_out = lw.buf.size();
+                }
                 dom::element doc;
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                prog->eval(value::of(doc), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(doc), root_env, lemit)) { ok = false; break; }
               }
-              if (ok && stream.truncated_bytes()) { ok = false; }
+              if (ok && stream.truncated_bytes()) {
+                ok = false;
+                keep = len - stream.truncated_bytes();
+                keep_out = lw.buf.size();
+              }
             }
           }
         } catch (...) {
           ok = false;
         }
+        if (!ok) {
+          // A changed input: the sequential path redoes the chunk and reports it.
+          if (g_input_changed.load()) { keep = keep_out = 0; }
+          lw.buf.resize(keep_out);
+        }
         std::string out;
-        if (ok) { out.swap(lw.buf); } else { lw.buf.clear(); }
+        out.swap(lw.buf);
+        bool wake_writer;
         {
           std::lock_guard<std::mutex> lock(mu);
           slots[k].out = std::move(out);
+          slots[k].resume = keep;
           slots[k].ok = ok;
           slots[k].done = true;
+          wake_writer = writer_waits == k;
         }
-        cv_done.notify_all();
+        if (wake_writer) { cv_done.notify_one(); }
       }
     };
     std::vector<std::thread> pool;
-    for (int t = 0; t < threads; t++) { pool.emplace_back(worker); }
+    if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel (%zu threads, %zu chunks)\n", nthreads, n); }
+    for (size_t t = 0; t < nthreads; t++) { pool.emplace_back(worker); }
     size_t resume = input.size();
     for (size_t k = 0; k < n; k++) {
       std::string out;
       bool ok;
+      size_t at;
       {
         std::unique_lock<std::mutex> lock(mu);
+        writer_waits = k;
         cv_done.wait(lock, [&] { return slots[k].done; });
+        writer_waits = n;
         out.swap(slots[k].out);
         ok = slots[k].ok;
+        at = slots[k].resume;
         if (!ok) { abort = true; }
         flushed = k + 1;
       }
-      cv_window.notify_all();
-      if (!ok) { resume = starts[k]; break; }
-      fwrite(out.data(), 1, out.size(), stdout);
-      if (flush_each) { fflush(stdout); }
+      // One more chunk fits in the window; after a failure, all workers stop.
+      if (ok) {
+        cv_window.notify_one();
+      } else {
+        cv_window.notify_all();
+      }
+      fwrite(out.data(), 1, out.size(), w.out);
+      if (flush_each) { fflush(w.out); }
+      if (!ok) {
+        resume = starts[k] + at;
+        if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: sequential from byte %zu\n", resume); }
+        break;
+      }
     }
+    // Workers still waiting for room see that every chunk is taken (or the
+    // abort) and return.
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      abort = true;
+    }
+    cv_window.notify_all();
     for (auto &t : pool) { t.join(); }
     return resume;
   };
@@ -761,13 +997,13 @@ int main(int argc, char **argv) {
     return stream_format::whitespace_delimited;
   };
 
-  // The parallel path cuts the input after newlines, about every megabyte. A
+  // The parallel path cuts the input after newlines, every 256 KiB or so. A
   // single large document (pretty-printed JSON) makes every chunk fail, and
   // the workers parse them for nothing before the input goes to the
   // sequential path. The first chunk tells: if it does not hold complete
   // documents, the input is not newline-delimited and stays sequential.
   auto first_chunk_is_documents = [&](const input_source &input) {
-    const size_t probe = size_t(1) << 20;
+    const size_t probe = size_t(256) << 10;
     const void *nl = memchr(input.data() + probe, '\n', input.size() - probe);
     if (!nl) { return false; }
     size_t len = size_t(static_cast<const char *>(nl) - input.data()) + 1;
@@ -792,9 +1028,8 @@ int main(int argc, char **argv) {
     line_pos = line_count = doc_end = 0;
     stream_format fmt = input_format(input.data(), input.size());
     size_t offset = 0;
-    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(4) << 20) &&
+    if (threads > 1 && fmt == stream_format::whitespace_delimited && input.size() >= (size_t(1) << 20) &&
         first_chunk_is_documents(input)) {
-      if (getenv("SJQ_DEBUG")) { fprintf(stderr, "sjq: parallel\n"); }
       w.flush();
       offset = run_parallel(input);
       if (offset == input.size()) { status = 0; }
@@ -855,6 +1090,40 @@ int main(int argc, char **argv) {
       if (!fmt_known && cut > 0) {
         fmt = input_format(buf.data(), cut);
         fmt_known = true;
+        bool bom16 = filled >= 2 && ((static_cast<unsigned char>(buf[0]) == 0xFF && static_cast<unsigned char>(buf[1]) == 0xFE) ||
+                                     (static_cast<unsigned char>(buf[0]) == 0xFE && static_cast<unsigned char>(buf[1]) == 0xFF));
+        if (bom16) {
+          // UTF-16 with a byte order mark (cmd's type command sends it): the
+          // whole input is read and converted, then filtered.
+          std::string all(buf.data(), filled);
+          char more[65536];
+          bool read_failed = false;
+          while (!eof) {
+            long long r = read_stdin(more, sizeof(more));
+            if (r < 0) { read_failed = true; }
+            if (r <= 0) { break; }
+            all.append(more, size_t(r));
+          }
+          if (read_failed) {
+            fprintf(stderr, "sjq: error: cannot read %s\n", name);
+            file_error = true;
+            fatal = true;
+            break;
+          }
+          std::string converted;
+          utf16_with_bom_to_utf8(all.data(), all.size(), converted);
+          input_source converted_input;
+          converted_input.adopt(converted);
+          run_input(converted_input, name);
+          break;
+        }
+        // All that was read, not only the complete lines: a producer can
+        // pause after a line in UTF-16 ("1\n" is 31 00 0A 00).
+        if (looks_like_utf16(buf.data(), filled)) {
+          fprintf(stderr, "sjq: error (at %s): %s\n", name, UTF16_ADVICE);
+          file_error = true;
+          break;
+        }
       }
       line_base = buf.data();
       size_t consumed = cut == 0 ? 0 : run_sequential(buf.data(), cut, 0, eof, fmt, name);
@@ -869,14 +1138,31 @@ int main(int argc, char **argv) {
     line_base = nullptr;
   };
 
+  // UTF-16 input: converted when it starts with a byte order mark, refused
+  // with an explanation otherwise.
+  auto check_encoding = [&](input_source &input, const char *name) {
+    std::string converted;
+    if (utf16_with_bom_to_utf8(input.data(), input.size(), converted)) {
+      input.adopt(converted);
+      return true;
+    }
+    if (looks_like_utf16(input.data(), input.size())) {
+      fprintf(stderr, "sjq: error (at %s): %s\n", name, UTF16_ADVICE);
+      file_error = true;
+      return false;
+    }
+    return true;
+  };
+
   for (const std::string &fname : files) {
+    if (halted) { break; }
     fatal = false;
     g_input_filename = fname == "-" ? nullptr : fname.c_str();
     if (fname == "-") {
       if (stdin_is_regular_file()) {
         input_source input;
         if (input.load_stdin_file(use_mmap)) {
-          run_input(input, "<stdin>");
+          if (check_encoding(input, "<stdin>")) { run_input(input, "<stdin>"); }
           continue;
         }
       }
@@ -885,12 +1171,12 @@ int main(int argc, char **argv) {
     }
     input_source input;
     if (!input.load(fname, use_mmap)) {
-      fprintf(stderr, "sjq: error: could not open %s\n", fname.c_str());
+      fprintf(stderr, "sjq: error: could not open %s: %s\n", fname.c_str(), open_failure_reason(fname).c_str());
       file_error = true;
       continue;
     }
+    if (!check_encoding(input, fname.c_str())) { continue; }
     run_input(input, fname.c_str());
   }
-  w.flush();
-  return final_status(status);
+  return finish(status);
 }

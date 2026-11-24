@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(sjq
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "A jq-compatible command-line JSON processor built on simdjson"
   LANGUAGES CXX
 )
@@ -44,6 +44,7 @@ endif()
 # The engine, shared by the executable and the fuzzer.
 add_library(sjq-core STATIC
   src/builtins.cpp
+  src/diagnose.cpp
   src/input.cpp
   src/ondemand.cpp
   src/parser.cpp

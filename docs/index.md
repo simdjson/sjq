@@ -12,8 +12,8 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and they usually run ten to a hundred times
-faster on large inputs. sjq parses JSON with simdjson's SIMD instructions,
+write for jq work with sjq, and on large inputs they run ten to almost two
+hundred times faster. sjq parses JSON with simdjson's SIMD instructions,
 reads only the parts of a document a filter needs when it can, maps files in
 memory instead of copying them, and filters large newline-delimited files on
 all cores.
@@ -29,9 +29,11 @@ curl -fsSL https://raw.githubusercontent.com/simdjson/sjq/main/install.sh | sh
 The script downloads the binary for your system from the latest
 [release](https://github.com/simdjson/sjq/releases), checks its SHA-256
 checksum and installs it in `~/.local/bin` (set `SJQ_INSTALL_DIR` to choose
-another directory, `SJQ_VERSION` to pick a release). The Linux binaries are
-static: they run on any distribution, x86-64 or ARM64. The macOS binary runs
-on Apple silicon and Intel Macs.
+another directory, `SJQ_VERSION` to pick a release). If that directory is
+not in your `PATH`, it prints the line to add to your shell's startup file
+(`~/.zshrc`, `~/.bashrc`, ...); with `SJQ_MODIFY_PATH=1` it adds the line
+itself. The Linux binaries are static: they run on any distribution, x86-64
+or ARM64. The macOS binary runs on Apple silicon and Intel Macs.
 
 **Windows** (PowerShell):
 
@@ -40,8 +42,16 @@ irm https://raw.githubusercontent.com/simdjson/sjq/main/install.ps1 | iex
 ```
 
 It installs `sjq.exe` in `%LOCALAPPDATA%\Programs\sjq` and adds that
-directory to your user `PATH`. You can also download the zip files from the
-releases page.
+directory to your user `PATH` (and to the current window). You can also
+download the zip files from the releases page.
+
+**With a package manager:**
+
+```
+brew install simdjson/tap/sjq                          # Homebrew (macOS, Linux)
+scoop bucket add sjq https://github.com/simdjson/sjq   # Scoop (Windows)
+scoop install sjq/sjq
+```
 
 **From source** (CMake 3.15 or later, a C++17 compiler):
 
@@ -120,6 +130,7 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--fractured` | FracturedJson layout (see below) |
 | `--width n` | with `--fractured`, the maximal line length (default 120) |
 | `-f`, `--from-file file` | read the filter from a file |
+| `-o`, `--output file` | write the output to a file (UTF-8, LF line ends). sjq writes a temporary file in the same directory and puts it in place at the end of a successful run: the file can also be an input, and a run with an error leaves it unchanged (and exits with a non-zero status). A symbolic link stays a link, and the file keeps its permissions; a hard link to it keeps the old content |
 | `--arg name value` | set `$name` to a string |
 | `--argjson name json` | set `$name` to a JSON value |
 | `--slurpfile name file` | set `$name` to an array of the JSON values of a file |
@@ -129,7 +140,7 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--unbuffered` | flush the output after each input |
 | `-b`, `--binary` | on Windows, write LF line ends |
 | `--threads n` | worker threads for large files (1: sequential) |
-| `--no-od`, `--no-mmap` | turn off the On-Demand fast path, or memory mapping |
+| `--no-od`, `--no-mmap` | turn off the On-Demand fast path (check all the input), or memory mapping |
 | `-V`, `--version`, `-h`, `--help` | |
 
 The exit status is 0 on success, 2 for usage and file errors, 3 when the
@@ -158,6 +169,39 @@ $ sjq --fractured '.statuses[:4] | map({id, lang, rt: .retweet_count, user: .use
 indentation (2). It works with `-r`, `-S` and `-a`, not with `-c` or
 `--tab`, and without colors.
 
+### Invalid JSON
+
+When a filter only navigates and selects (`.a.b`, `.[]`, `select(.x > 1)`,
+`{id, name}`, `length`), sjq runs it on simdjson's On-Demand API, which parses
+only what the filter reads. The parts of a document the filter skips are not
+fully checked: `sjq .a` prints `1` for `{"a": 1, "b": tru}`, where jq reports
+an error. Some errors are caught everywhere, because simdjson checks the whole
+document for them: invalid UTF-8, unclosed strings, unbalanced brackets. With
+`--no-od`, or with any filter that needs the general evaluator, every document
+is checked in full, as jq does. Errors are reported with a line and a column:
+
+```
+$ echo '{"a": 1, "b": [1, 2}' | sjq --no-od .a
+sjq: error (at <stdin>): invalid JSON at line 1, column 20: expected ',' or ']' but found '}'
+```
+
+### Windows: quoting {#windows}
+
+The jq language uses double quotes and characters that Windows shells treat
+specially.
+
+- In the Command Prompt (cmd), single quotes are not quotes: write
+  `sjq ".a" file.json`, with `\"` for a double quote inside the filter
+  (`sjq "select(.name == \"x\")" file.json`).
+- Windows PowerShell 5 removes the double quotes inside an argument passed to
+  a program: `'."année"'` reaches sjq as `.année`. PowerShell 7 does not.
+- In both, the simplest is to put the filter in a file and use `-f`:
+  `sjq -f filter.jq file.json`. A byte order mark at the start of the file is
+  fine.
+- Windows PowerShell 5's `>` writes UTF-16. sjq reads UTF-16 files that start
+  with a byte order mark, but other programs may not: use `-o out.json`, and
+  sjq writes the file itself, in UTF-8.
+
 ## Performance {#performance}
 
 These charts compare sjq with jq 1.8.2 (the official static Linux binary) on
@@ -167,8 +211,9 @@ hyperfine runs (3 for jq, 10 for sjq), with the output written to
 `/dev/null`; the outputs of jq and sjq were checked to be identical. "sjq" is
 the default (all cores on large newline-delimited files);
 "sjq --threads 1" is sequential. The machine has two sockets, and the time of
-a run on one core depends on the socket it lands on (up to 25%): the
-single-document runs of all three tools are pinned to the same socket.
+a run on one core depends on the socket it lands on (up to 25%): every run on
+one thread (jq, "sjq --threads 1", and sjq on the single document) is pinned
+to the same socket.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench-ndjson-dark.svg">
@@ -185,7 +230,7 @@ single-document runs of all three tools are pinned to the same socket.
 These workloads show where sjq is strongest: large inputs, whose parsing
 dominates. Even sequential, sjq is twelve to forty times faster than jq here;
 on large newline-delimited files, its worker threads add another factor of
-three to eight. Filters with regular expressions run on one thread. A single
+five to nine. Filters with regular expressions run on one thread. A single
 large document is parsed by one thread. Filters that compute a lot on small
 inputs gain less. To reproduce the
 numbers, see [`bench/`](https://github.com/simdjson/sjq/tree/main/bench).
@@ -249,6 +294,8 @@ unchanged.
 - No modules (`import`, `include`) and no `--stream`; `input_line_number`
   is always 0. sjq also has `@base32`, `@base32d`, `leaf_paths` and
   `toarray`, which jq 1.8.2 lacks.
+- Filters that only navigate and select do not check the parts of the input
+  they skip (see [Invalid JSON](#invalid-json)); `--no-od` checks everything.
 - Objects with duplicate keys: `.a` finds the first `"a"`, `.` prints every
   pair; jq keeps the last value.
 - Values nested more than 10,000 levels deep end with an error.

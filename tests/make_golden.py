@@ -110,6 +110,8 @@ SPECS = {
     "language": [
         # Tutorial-style programs (jq's tutorial, a course activity).
         (["-c"], ".livres[] | {titre, annee}", LIB),
+        (["-c"], "{a, a: .x.y, c: [.a, .x], d: 1, e: 2, f: 3, g: 4}", '{"a":1,"x":{"y":2,"x":{"y":2}}}'),
+        (["-c"], "{a: (1,2), a: (3,4), b: (5,6), c: 7, d: 8, e: 9}", "null"),
         (["-r"], '.livres[] | .titre as $t | .prix // "non vendu" | "\\($t) : \\(.)"', LIB),
         (["-r"], '.livres[] | "| \\(.titre) | \\(.genres | join(", ")) | \\((.emprunts // []) | length) |"', LIB),
         (["-c"], ".livres | map({key: .id, value: {titre}}) | from_entries", LIB),

@@ -604,11 +604,21 @@ struct object_node : node {
         size_t saved = acc.size();
         auto it = std::find_if(acc.begin(), acc.end(), [&](const auto &kv) { return kv.first == key; });
         value prev;
-        bool replaced = false;
-        if (it != acc.end()) { prev = it->second; it->second = v; replaced = true; }
-        else { acc.emplace_back(std::move(key), v); }
+        bool replaced = it != acc.end();
+        // An index, not the iterator: the next entries can grow acc.
+        size_t pos = size_t(it - acc.begin());
+        if (replaced) {
+          prev = acc[pos].second;
+          acc[pos].second = v;
+        } else {
+          acc.emplace_back(std::move(key), v);
+        }
         build(i + 1, acc, in, e, out);
-        if (replaced) { it->second = prev; } else { acc.resize(saved); }
+        if (replaced) {
+          acc[pos].second = prev;
+        } else {
+          acc.resize(saved);
+        }
       });
     });
   }
@@ -753,6 +763,19 @@ value get_path(const value &t, const path_t &p, size_t from = 0);
 // copied first.
 void set_path(value &t, const path_t &p, size_t from, const value &v);
 value delete_paths(const value &t, std::vector<path_t> ps);
+
+// An error in the filter, at a byte offset of its text, with an optional
+// hint for the user.
+struct syntax_error : std::runtime_error {
+  size_t pos;
+  std::string hint;
+  syntax_error(const std::string &m, size_t at, std::string h = std::string())
+      : std::runtime_error(m), pos(at), hint(std::move(h)) {}
+};
+
+// Formats an error of compile(): the message, the line and column, the line
+// of the filter with a caret under the problem, and the hint.
+std::string describe_syntax_error(const std::string &src, const syntax_error &err);
 
 // What the driver needs to know about a filter.
 struct compile_info {

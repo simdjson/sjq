@@ -6,6 +6,23 @@
 {"titre":"Le Petit Prince","annee":1943}
 {"titre":"Fondation","annee":1951}
 
+%%FLAGS -c
+{a, a: .x.y, c: [.a, .x], d: 1, e: 2, f: 3, g: 4}
+{"a":1,"x":{"y":2,"x":{"y":2}}}
+{"a":2,"c":[1,{"y":2,"x":{"y":2}}],"d":1,"e":2,"f":3,"g":4}
+
+%%FLAGS -c
+{a: (1,2), a: (3,4), b: (5,6), c: 7, d: 8, e: 9}
+null
+{"a":3,"b":5,"c":7,"d":8,"e":9}
+{"a":3,"b":6,"c":7,"d":8,"e":9}
+{"a":4,"b":5,"c":7,"d":8,"e":9}
+{"a":4,"b":6,"c":7,"d":8,"e":9}
+{"a":3,"b":5,"c":7,"d":8,"e":9}
+{"a":3,"b":6,"c":7,"d":8,"e":9}
+{"a":4,"b":5,"c":7,"d":8,"e":9}
+{"a":4,"b":6,"c":7,"d":8,"e":9}
+
 %%FLAGS -r
 .livres[] | .titre as $t | .prix // "non vendu" | "\($t) : \(.)"
 {"nom":"Médiathèque","livres":[{"id":"b001","titre":"1984","auteur":"George Orwell","annee":1949,"genres":["dystopie","politique"],"empruntable":true,"emprunts":[{"lecteur":"Alice"},{"lecteur":"Bob"}]},{"id":"b002","titre":"Le Petit Prince","auteur":"Saint-Exupéry","annee":1943,"genres":["conte"],"empruntable":false},{"id":"b003","titre":"Fondation","auteur":"Isaac Asimov","annee":1951,"genres":["science-fiction"],"empruntable":true,"prix":19}]}

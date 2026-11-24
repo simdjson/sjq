@@ -50,6 +50,9 @@ jobs:
   macos:
     name: macos-universal
     runs-on: macos-15
+    # GitHub's macOS runners are often unavailable: a failure here does not
+    # fail the release (scripts/release-macos.sh attaches the binary later).
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - name: Build

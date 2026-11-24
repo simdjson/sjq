@@ -3,12 +3,15 @@
 # Usage: run_bench.sh DATA_DIR RESULTS_DIR JQ SJQ HYPERFINE
 #
 # Environment:
-#   PIN_DOCUMENT  a command prefix for the workloads on the single document,
-#                 for example "taskset -c 1-127:2": on a machine with several
-#                 sockets, the time of a one-thread run depends on the socket
-#                 it lands on, so all three tools run on the same one.
+#   PIN_DOCUMENT  a command prefix for the runs on one thread (jq, sjq
+#                 --threads 1, and sjq on the single document), for example
+#                 "taskset -c 1-127:2": on a machine with several sockets, the
+#                 time of a one-thread run depends on the socket it lands on
+#                 (up to 25%), so they all run on the same one.
 #   ONLY          workload numbers to run, for example "07 08 09" (the others
 #                 keep their results; index.tsv is rewritten in full).
+#   SKIP_JQ       1: time sjq only, and keep jq's results (after a change to
+#                 sjq, with the same jq, data and machine).
 set -e
 DATA=$1; OUT=$2; JQ=$3; SJQ=$4; HF=$5
 mkdir -p "$OUT"
@@ -21,10 +24,12 @@ bench() {
   if [ -n "${ONLY:-}" ] && ! echo " $ONLY " | grep -q " $id "; then return; fi
   local args=""
   for a in "$@"; do args="$args '$a'"; done
-  local pin=""
-  if [ "$file" = timeline.json ]; then pin="${PIN_DOCUMENT:-}"; fi
-  "$HF" --shell=default --style basic --warmup 1 --runs 3 --export-json "$OUT/$id-jq.json" -n "jq" "$pin $JQ $args $DATA/$file > /dev/null"
-  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq.json" -n "sjq" "$pin $SJQ $args $DATA/$file > /dev/null"
+  local pin="${PIN_DOCUMENT:-}" pin_sjq=""
+  if [ "$file" = timeline.json ]; then pin_sjq="$pin"; fi
+  if [ "${SKIP_JQ:-}" != 1 ]; then
+    "$HF" --shell=default --style basic --warmup 1 --runs 3 --export-json "$OUT/$id-jq.json" -n "jq" "$pin $JQ $args $DATA/$file > /dev/null"
+  fi
+  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq.json" -n "sjq" "$pin_sjq $SJQ $args $DATA/$file > /dev/null"
   "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq1.json" -n "sjq --threads 1" "$pin $SJQ --threads 1 $args $DATA/$file > /dev/null"
 }
 rm -f "$OUT/index.tsv.new"

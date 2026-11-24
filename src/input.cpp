@@ -25,10 +25,12 @@
 #include "simdjson.h"
 
 #include <climits>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace sjq {
 
@@ -114,10 +116,308 @@ bool input_source::load(const std::string &fname, bool use_mmap) {
 #else
   (void)use_mmap;
 #endif
-  if (simdjson::padded_string::load(fname).get(p_->owned)) { return false; }
+  if (is_regular_file(fname.c_str())) {
+    if (simdjson::padded_string::load(fname).get(p_->owned)) { return false; }
+  } else {
+    // A pipe or another stream given by name (sjq . <(curl ...)): read to the
+    // end, since it cannot be measured or mapped.
+    FILE *f = fopen(fname.c_str(), "rb");
+    if (!f) { return false; }
+    std::string text;
+    char buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) { text.append(buf, got); }
+    bool failed = ferror(f) != 0;
+    fclose(f);
+    if (failed) { return false; }
+    p_->owned = simdjson::padded_string(text);
+  }
   p_->p = p_->owned.data();
   p_->n = p_->owned.size();
   return true;
+}
+
+void input_source::adopt(const std::string &text) {
+  if (p_->mapped) {
+    g_map_base.store(nullptr);
+    g_map_len.store(0);
+    p_->mapped = false;
+  }
+#if SIMDJSON_HAS_PADDED_MEMORY_MAP
+  p_->map.reset();
+#endif
+  p_->owned = simdjson::padded_string(text);
+  p_->p = p_->owned.data();
+  p_->n = p_->owned.size();
+}
+
+#if defined(_WIN32)
+static std::string windows_reason(DWORD e);
+#endif
+
+std::string output_problem(const std::string &fname) {
+#if defined(_WIN32)
+  // The process code page is UTF-8 (see sjq.manifest): the A functions take
+  // any file name.
+  DWORD attr = GetFileAttributesA(fname.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES) { return ""; }  // a new file
+  if (attr & FILE_ATTRIBUTE_DIRECTORY) { return "it is a directory"; }
+  if (attr & FILE_ATTRIBUTE_READONLY) { return "the file is read-only"; }
+  HANDLE h = CreateFileA(fname.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) { return windows_reason(GetLastError()); }
+  CloseHandle(h);
+  return "";
+#else
+  struct stat st{};
+  if (stat(fname.c_str(), &st) == 0) {
+    if (S_ISDIR(st.st_mode)) { return strerror(EISDIR); }
+    if (access(fname.c_str(), W_OK) != 0) { return strerror(errno); }
+    return "";
+  }
+  if (errno != ENOENT) { return strerror(errno); }
+  // A new file: its directory must accept it.
+  size_t slash = fname.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : fname.substr(0, slash));
+  if (access(dir.c_str(), W_OK | X_OK) != 0) { return strerror(errno); }
+  return "";
+#endif
+}
+
+// -o FILE. The temporary file, removed when sjq is interrupted.
+#if defined(_WIN32)
+static wchar_t g_output_tmp[32768];
+#else
+static char g_output_tmp[4096];
+#endif
+static volatile sig_atomic_t g_output_tmp_set = 0;
+
+static void remove_output_tmp(int sig) {
+  if (g_output_tmp_set) {
+#if defined(_WIN32)
+    DeleteFileW(g_output_tmp);
+#else
+    unlink(g_output_tmp);
+#endif
+  }
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+static void watch_output_tmp() {
+  g_output_tmp_set = 1;
+  signal(SIGINT, remove_output_tmp);
+  signal(SIGTERM, remove_output_tmp);
+#if !defined(_WIN32)
+  signal(SIGHUP, remove_output_tmp);
+#endif
+}
+
+#if defined(_WIN32)
+static std::wstring to_wide(const std::string &s) {
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+  std::wstring w(size_t(n), L'\0');
+  if (n > 0) { MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), &w[0], n); }
+  return w;
+}
+
+static std::string windows_reason(DWORD e) {
+  if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION) { return "the file is open in another program"; }
+  if (e == ERROR_ACCESS_DENIED) { return "Permission denied"; }
+  if (e == ERROR_DISK_FULL || e == ERROR_HANDLE_DISK_FULL) { return "No space left on device"; }
+  return "Windows error " + std::to_string(e);
+}
+#endif
+
+bool open_output(const std::string &fname, output_file &out, std::string &why) {
+  out = output_file{};
+#if defined(_WIN32)
+  std::wstring wname = to_wide(fname);
+  HANDLE probe = CreateFileW(wname.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (probe != INVALID_HANDLE_VALUE) {
+    DWORD type = GetFileType(probe);
+    CloseHandle(probe);
+    if (type != FILE_TYPE_DISK) {
+      // A device (NUL, CON): written directly.
+      out.f = _wfopen(wname.c_str(), L"wb");
+      if (!out.f) { why = strerror(errno); }
+      return out.f != nullptr;
+    }
+  }
+  DWORD n = GetFullPathNameW(wname.c_str(), 0, nullptr, nullptr);
+  std::wstring full(n, L'\0');
+  if (n == 0 || GetFullPathNameW(wname.c_str(), n, &full[0], nullptr) == 0) {
+    why = windows_reason(GetLastError());
+    return false;
+  }
+  full.resize(wcslen(full.c_str()));
+  size_t slash = full.find_last_of(L"\\/");
+  std::wstring dir = slash == std::wstring::npos ? L"." : full.substr(0, slash + 1);
+  wchar_t tmp[MAX_PATH + 1];
+  if (dir.size() > MAX_PATH - 14 || GetTempFileNameW(dir.c_str(), L"sjq", 0, tmp) == 0) {
+    why = windows_reason(GetLastError());
+    return false;
+  }
+  out.wtmp = tmp;
+  out.wtarget = full;
+  wcsncpy(g_output_tmp, tmp, MAX_PATH + 1);
+  watch_output_tmp();
+  // FILE_SHARE_DELETE: an interrupted sjq can delete it while it is open.
+  HANDLE h = CreateFileW(tmp, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  int fd = h == INVALID_HANDLE_VALUE ? -1 : _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_BINARY);
+  if (fd >= 0) { out.f = _fdopen(fd, "wb"); }
+  if (!out.f) {
+    why = windows_reason(GetLastError());
+    if (fd >= 0) { _close(fd); } else if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); }
+    discard_output(out);
+    return false;
+  }
+  return true;
+#else
+  struct stat st{};
+  bool exists = stat(fname.c_str(), &st) == 0;
+  if (exists && !S_ISREG(st.st_mode)) {
+    // A device or a pipe (/dev/null, /dev/stdout, a FIFO): written directly.
+    out.f = fopen(fname.c_str(), "wb");
+    if (!out.f) { why = strerror(errno); }
+    return out.f != nullptr;
+  }
+  // Next to the real file: a symbolic link stays a link to the new content.
+  std::string real = fname;
+  if (exists) {
+    char *rp = realpath(fname.c_str(), nullptr);
+    if (rp) {
+      real = rp;
+      free(rp);
+    }
+  }
+  size_t slash = real.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "" : real.substr(0, slash + 1);
+  std::string base = slash == std::string::npos ? real : real.substr(slash + 1);
+  std::string tmpl = dir + "." + base + ".sjq-XXXXXX";
+  if (tmpl.size() >= sizeof(g_output_tmp)) {
+    why = strerror(ENAMETOOLONG);
+    return false;
+  }
+  memcpy(g_output_tmp, tmpl.c_str(), tmpl.size() + 1);
+  // mkstemp creates the file exclusively, with a name nobody can predict.
+  int fd = mkstemp(g_output_tmp);
+  if (fd < 0) {
+    why = std::string(strerror(errno)) + " (sjq writes a temporary file in the directory of " + fname + ")";
+    return false;
+  }
+  out.tmp = g_output_tmp;
+  out.target = real;
+  watch_output_tmp();
+  // The permissions and owner of the file it replaces (the owner when
+  // allowed), or those of a new file.
+  mode_t mode;
+  if (exists) {
+    mode = st.st_mode & 07777;
+    if (fchown(fd, st.st_uid, st.st_gid) != 0) {
+      // Another owner: the new file is the user's, as with an editor.
+    }
+  } else {
+    mode_t mask = umask(0);
+    umask(mask);
+    mode = 0666 & ~mask;
+  }
+  if (fchmod(fd, mode) != 0 || !(out.f = fdopen(fd, "wb"))) {
+    why = strerror(errno);
+    close(fd);
+    discard_output(out);
+    return false;
+  }
+  return true;
+#endif
+}
+
+bool commit_output(output_file &out, std::string &why) {
+  if (!out.f) { return true; }
+  FILE *f = out.f;
+  out.f = nullptr;
+  bool ok = fflush(f) == 0 && !ferror(f);
+  if (!ok) { why = strerror(errno); }
+  if (fclose(f) != 0 && ok) {
+    why = strerror(errno);
+    ok = false;
+  }
+#if defined(_WIN32)
+  if (out.wtmp.empty()) { return ok; }
+  if (ok) {
+    // ReplaceFileW keeps the attributes and ACLs of the file it replaces.
+    bool exists = GetFileAttributesW(out.wtarget.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!(exists && ReplaceFileW(out.wtarget.c_str(), out.wtmp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) &&
+        !MoveFileExW(out.wtmp.c_str(), out.wtarget.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      why = windows_reason(GetLastError());
+      ok = false;
+    }
+  }
+#else
+  if (out.tmp.empty()) { return ok; }
+  if (ok && rename(out.tmp.c_str(), out.target.c_str()) != 0) {
+    why = strerror(errno);
+    ok = false;
+  }
+#endif
+  if (ok) {
+    g_output_tmp_set = 0;
+  } else {
+    discard_output(out);
+  }
+  return ok;
+}
+
+void discard_output(output_file &out) {
+  if (out.f) {
+    fclose(out.f);
+    out.f = nullptr;
+  }
+  g_output_tmp_set = 0;
+#if defined(_WIN32)
+  if (!out.wtmp.empty()) { DeleteFileW(out.wtmp.c_str()); }
+  out.wtmp.clear();
+#else
+  if (!out.tmp.empty()) { unlink(out.tmp.c_str()); }
+  out.tmp.clear();
+#endif
+}
+
+std::string open_failure_reason(const std::string &fname) {
+#if defined(_WIN32)
+  DWORD attr = GetFileAttributesA(fname.c_str());
+  if (attr == INVALID_FILE_ATTRIBUTES) {
+    DWORD e = GetLastError();
+    if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) { return "No such file or directory"; }
+    if (e == ERROR_ACCESS_DENIED) { return "Permission denied"; }
+    return "cannot access the file (Windows error " + std::to_string(e) + ")";
+  }
+  if (attr & FILE_ATTRIBUTE_DIRECTORY) { return "Is a directory"; }
+  HANDLE h = CreateFileA(fname.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) { return windows_reason(GetLastError()); }
+  char byte;
+  DWORD got = 0;
+  BOOL read_ok = ReadFile(h, &byte, 1, &got, nullptr);
+  DWORD e = GetLastError();
+  CloseHandle(h);
+  if (!read_ok) { return windows_reason(e); }
+  return "the file could not be read (it may have changed while sjq read it)";
+#else
+  struct stat st{};
+  if (stat(fname.c_str(), &st) != 0) { return strerror(errno); }
+  if (S_ISDIR(st.st_mode)) { return strerror(EISDIR); }
+  FILE *f = fopen(fname.c_str(), "rb");
+  if (!f) { return strerror(errno); }
+  char byte;
+  errno = 0;
+  bool read_failed = fread(&byte, 1, 1, f) == 0 && ferror(f);
+  int e = errno;
+  fclose(f);
+  if (read_failed && e != 0) { return strerror(e); }
+  return "the file could not be read (it may have changed while sjq read it)";
+#endif
 }
 
 bool input_source::load_stdin_file(bool use_mmap) {

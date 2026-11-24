@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "description": "A jq-compatible command-line JSON processor built on simdjson",
+    "homepage": "https://simdjson.github.io/sjq/",
+    "license": "Apache-2.0|MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/simdjson/sjq/releases/download/v0.2.0/sjq-windows-x86_64.zip",
+            "hash": "f8ddad7f41254b7f48cfbf131499240f896db0534b44dad854d0985b4495b2da"
+        },
+        "arm64": {
+            "url": "https://github.com/simdjson/sjq/releases/download/v0.2.0/sjq-windows-arm64.zip",
+            "hash": "0dbfd4c1c3d45d0a722856f175545d9ba2963f93282d15c943945152f9190a3a"
+        }
+    },
+    "bin": "sjq.exe",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": { "url": "https://github.com/simdjson/sjq/releases/download/v$version/sjq-windows-x86_64.zip" },
+            "arm64": { "url": "https://github.com/simdjson/sjq/releases/download/v$version/sjq-windows-arm64.zip" }
+        },
+        "hash": { "url": "https://github.com/simdjson/sjq/releases/download/v$version/SHA256SUMS" }
+    }
+}

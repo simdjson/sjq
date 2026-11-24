@@ -249,6 +249,138 @@ def targeted(sjq, data, tmp):
     check("empty input", run([sjq, "."], b"") == (0, b"", b""))
     check("blank input", run([sjq, "."], b"  \n ") == (0, b"", b""))
 
+    # Errors in filters: the position, a caret, hints.
+    code, _, err = run([sjq, "select(.prix > )"], b"{}")
+    check("filter error position", code == 3 and b"line 1, column 16" in err and b"    select(.prix > )\n" in err
+          and b"\n                   ^\n" in err, repr(err))
+    code, _, err = run([sjq, ".ann\u00e9e"], b"{}")
+    check("filter error non-ASCII field", code == 3 and "unexpected character '\u00e9'".encode() in err
+          and '."ann\u00e9e"'.encode() in err, repr(err))
+    code, _, err = run([sjq, "'.a'"], b"{}")
+    check("filter error single quotes", code == 3 and b"single quotes" in err and b"-f" in err, repr(err))
+    code, _, err = run([sjq, ".a | lenght"], b"{}")
+    check("filter error typo", code == 3 and b"did you mean length?" in err and b"column 6" in err, repr(err))
+    code, _, err = run([sjq, "split"], b"{}")
+    check("filter error arity", code == 3 and b"split takes 1 or 2 arguments, not 0" in err, repr(err))
+    code, _, err = run([sjq, "1 as $count | $cuont"], b"{}")
+    check("filter error variable typo", code == 3 and b"did you mean $count?" in err, repr(err))
+
+    # Errors in JSON input: plain words, line and column.
+    code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"b":[1,2}\n')
+    check("JSON error position", code == 5 and out == b'{"a":1}\n' and b"invalid JSON at line 2, column 10: expected ',' or ']' but found '}'" in err,
+          repr(err))
+    code, _, err = run([sjq, "."], b'{"a":1,}')
+    check("JSON error trailing comma", code == 5 and b"found '}' after ','" in err and b"TAPE_ERROR" not in err, repr(err))
+    code, _, err = run([sjq, ".", os.path.join(tmp, "nope.json")])
+    check("missing file reason", code == 2 and (b"No such file or directory" in err), repr(err))
+
+    # Windows: a byte order mark in a filter file, UTF-16 input, -o.
+    fpath = os.path.join(tmp, "bom.jq")
+    with open(fpath, "wb") as f:
+        f.write(b"\xef\xbb\xbf.a")
+    code, out, err = run([sjq, "-f", fpath], b'{"a": 7}')
+    check("-f with a byte order mark", code == 0 and out == b"7\n", f"exit {code} {out!r} {err!r}")
+    u16 = os.path.join(tmp, "u16.json")
+    with open(u16, "wb") as f:
+        f.write('{"a": "\u00e9t\u00e9"}\r\n'.encode("utf-16"))  # with a byte order mark
+    code, out, err = run([sjq, "-r", ".a", u16])
+    check("UTF-16 input with a byte order mark", code == 0 and out == "\u00e9t\u00e9\n".encode(), f"exit {code} {out!r} {err!r}")
+    with open(u16, "wb") as f:
+        f.write('{"a": 1}'.encode("utf-16-le"))
+    code, out, err = run([sjq, ".a", u16])
+    check("UTF-16 input without a byte order mark", code == 2 and b"UTF-16" in err and b"-o" in err, f"exit {code} {err!r}")
+    opath = os.path.join(tmp, "out.json")
+    code, out, err = run([sjq, "-o", opath, ".a"], '{"a": "\u00e9"}'.encode())
+    with open(opath, "rb") as f:
+        written = f.read()
+    check("-o FILE", code == 0 and out == b"" and written == '"\u00e9"\n'.encode(), f"exit {code} {written!r} {err!r}")
+
+    # -o: the file is replaced only after a successful run.
+    dpath = os.path.join(tmp, "same.json")
+    with open(dpath, "wb") as f:
+        f.write(b'{"b": {"c": 1}, "z": 2}')
+    code, out, err = run([sjq, "-c", "-o", dpath, ".b", dpath])
+    with open(dpath, "rb") as f:
+        written = f.read()
+    check("-o onto the input file", code == 0 and written == b'{"c":1}\n', f"exit {code} {written!r} {err!r}")
+    for label, argv in (("filter error", [".a | lenght", dpath]), ("missing input", [".", os.path.join(tmp, "nope.json")]),
+                        ("runtime error", ["error(\"x\")", dpath])):
+        code, _, err = run([sjq, "-o", dpath] + argv)
+        with open(dpath, "rb") as f:
+            kept = f.read()
+        check(f"-o keeps the file after a {label}", code != 0 and kept == b'{"c":1}\n', f"exit {code} {kept!r} {err!r}")
+    leftovers = [n for n in os.listdir(tmp) if ".sjq-" in n]
+    check("-o leaves no temporary file", not leftovers, repr(leftovers))
+    # An error on one input, then success on the next, is still a failed run.
+    two = os.path.join(tmp, "two.ndjson")
+    with open(two, "wb") as f:
+        f.write(b"1\n2\n")
+    code, _, err = run([sjq, "-o", dpath, 'if .==1 then error("x") else . end', two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("-o keeps the file after an error on an earlier input, exit 5", code == 5 and kept == b'{"c":1}\n',
+          f"exit {code} {kept!r} {err!r}")
+    code, _, err = run([sjq, "-o", dpath, 'if .==1 then error("x") else halt end', two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("-o keeps the file after an error, then halt", code == 5 and kept == b'{"c":1}\n', f"exit {code} {kept!r}")
+    badj = os.path.join(tmp, "bad-array.json")
+    with open(badj, "wb") as f:
+        f.write(b"[1,\n")
+    code, _, err = run([sjq, "-o", dpath, ".", badj, two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("invalid input, then valid input: exit 5 and -o unchanged", code == 5 and kept == b'{"c":1}\n', f"exit {code} {kept!r}")
+    code, _, _ = run([sjq, "-o", dpath, "-n", "1, halt, 2"])
+    with open(dpath, "rb") as f:
+        written = f.read()
+    check("-o with halt keeps the output so far", code == 0 and written == b"1\n", f"exit {code} {written!r}")
+    if sys.platform != "win32":
+        real = os.path.join(tmp, "real.json")
+        link = os.path.join(tmp, "link.json")
+        with open(real, "wb") as f:
+            f.write(b'{"a": 1}')
+        os.chmod(real, 0o600)
+        os.symlink("real.json", link)
+        code, _, err = run([sjq, "-c", "-o", link, ".a = 2", link])
+        with open(real, "rb") as f:
+            written = f.read()
+        check("-o writes through a symbolic link", code == 0 and os.path.islink(link) and written == b'{"a":2}\n',
+              f"exit {code} {written!r} {err!r}")
+        check("-o keeps the permissions", (os.stat(real).st_mode & 0o777) == 0o600, oct(os.stat(real).st_mode))
+
+    # Errors in strings of filters point at the escape, or at the end.
+    code, _, err = run([sjq, "-n", '"abc\\q"'])
+    check("filter error escape position", code == 3 and b"column 5" in err, repr(err))
+    code, _, err = run([sjq, "-n", '"abc'])
+    check("filter error unterminated string", code == 3 and b"unterminated string at line 1, column 5" in err, repr(err))
+    code, out, _ = run([sjq, "-n", '"  {,}", "1 2" | try fromjson catch .'])
+    check("fromjson error positions", code == 0 and b"column 4: expected a string" in out and b"unexpected content after the JSON value" in out,
+          repr(out))
+
+    # UTF-16 through a pipe (cmd's type), with -R.
+    with open(u16, "wb") as f:
+        f.write('{"a": "\u00e9"}'.encode("utf-16"))
+    with open(u16, "rb") as f:
+        p = subprocess.run([sjq, "-r", ".a"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=f.read(), timeout=TIMEOUT)
+    check("UTF-16 through a pipe", p.returncode == 0 and norm(p.stdout) == "\u00e9\n".encode(), f"exit {p.returncode} {p.stdout!r} {p.stderr!r}")
+    with open(u16, "wb") as f:
+        f.write("line\n".encode("utf-16-le"))
+    code, _, err = run([sjq, "-R", ".", u16])
+    check("UTF-16 with -R", code == 2 and b"UTF-16" in err, f"exit {code} {err!r}")
+    p = subprocess.run([sjq, "."], stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=b"1\x00\n\x00", timeout=TIMEOUT)
+    check("short UTF-16 through a pipe", p.returncode == 2 and b"UTF-16" in p.stderr, f"exit {p.returncode} {p.stderr!r}")
+
+    # A stream given by name (process substitution, a FIFO).
+    if sys.platform != "win32" and hasattr(os, "mkfifo"):
+        fifo = os.path.join(tmp, "fifo")
+        os.mkfifo(fifo)
+        writer = threading.Thread(target=lambda: open(fifo, "wb").write(b'{"k": 5}'))
+        writer.start()
+        code, out, err = run([sjq, ".k", fifo])
+        writer.join(10)
+        check("FIFO given by name", code == 0 and out == b"5\n", f"exit {code} {out!r} {err!r}")
+
     # --fractured (simdjson's FracturedJson layout).
     rows = b'[{"id":1,"name":"a","n":10},{"id":22,"name":"bbb","n":3}]'
     code, out, err = run([sjq, "--fractured", "--width", "40", "."], rows)
@@ -329,6 +461,20 @@ def targeted(sjq, data, tmp):
     check("--fractured parallel and sequential", code1 == 0 and code2 == 0 and out1 == out2 and out1.startswith(b'{ "i": 0, "a": [0, 0], "o": {"k": "0"} }\n'),
           f"exit {code1} {code2} {out1[:80]!r} {out2[:80]!r}")
 
+    # halt in a file larger than a parse batch: sjq used to read the state of
+    # the stream after stopping early. SJQ_TEST_BATCH makes the batch 1 MB.
+    for threads in ("1", "4"):
+        p = subprocess.run([sjq, "--threads", threads, "-c", 'if .i == 100000 then halt_error(7) else empty end', nd_path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT,
+                           env=dict(os.environ, SJQ_TEST_BATCH=str(1 << 20)))
+        check(f"halt_error in a file larger than a batch (--threads {threads})", p.returncode == 7,
+              f"exit {p.returncode} {p.stderr[-300:]!r}")
+    opath2 = os.path.join(tmp, "parallel-out.json")
+    code, _, err = run([sjq, "-c", "-o", opath2, ".o", nd_path])
+    with open(opath2, "rb") as f:
+        written = f.read()
+    check("-o on the parallel path", code == 0 and written == want, f"exit {code}, {len(written)} bytes {err!r}")
+
     # Only newline-delimited input goes to the worker threads: one large
     # pretty-printed document, or pretty-printed documents, stay sequential.
     code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1"})
@@ -350,8 +496,71 @@ def targeted(sjq, data, tmp):
         f.write(bad_doc)
     code, out, _ = run([sjq, "-c", ".i", bad_path])
     check("error mid-stream", code == 5 and out.count(b"\n") == 60000, f"exit {code}, {out.count(chr(10).encode())} lines")
+    # The parallel path keeps the output of the failing chunk's documents
+    # before the error, and the sequential path resumes at the bad document:
+    # the same output, status and message as with one thread.
+    bad_at = len(b"\n".join(bad[:60000])) + 1
+    for filt in (".i", "{i, n: (.a | add)}"):
+        seq_p = subprocess.run([sjq, "--threads", "1", "-c", filt, bad_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT)
+        par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, bad_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
+        # Windows ends the lines of standard error with CRLF.
+        seq_err = seq_p.stderr.replace(b"\r\n", b"\n")
+        par_all = par_p.stderr.replace(b"\r\n", b"\n")
+        par_err = b"\n".join(l for l in par_all.split(b"\n") if not l.startswith(b"sjq: parallel")
+                             and not l.startswith(b"sjq: sequential") and not l.endswith(b" path"))
+        check(f"error mid-stream, parallel as sequential ({filt})",
+              par_p.returncode == seq_p.returncode == 5 and par_p.stdout == seq_p.stdout and par_err == seq_err,
+              f"exit {par_p.returncode}/{seq_p.returncode} {par_err[-200:]!r} {seq_err[-200:]!r}")
+        check(f"error mid-stream resumes at the bad document ({filt})",
+              f"sjq: sequential from byte {bad_at}\n".encode() in par_all, repr(par_all[-300:]))
+    # A line cut short in the middle: the fast path prints .i from the start
+    # of the cut document before the error is found there. It is printed once,
+    # as with one thread, also when the cut document starts a chunk.
+    for at in (60000, 0):
+        cut = bad[:at] + [b'{"i": %d, "a": [1,' % at] + bad[at + 1:]
+        cut_path = os.path.join(tmp, "cut.ndjson")
+        with open(cut_path, "wb") as f:
+            f.write(b"\n".join(cut))
+        seq_p = subprocess.run([sjq, "--threads", "1", "-c", ".i", cut_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=TIMEOUT)
+        for threads in ("2", "4", "16"):
+            par_p = subprocess.run([sjq, "--threads", threads, "-c", ".i", cut_path], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=TIMEOUT)
+            check(f"line cut short at {at}, --threads {threads} as sequential",
+                  par_p.returncode == seq_p.returncode != 0 and par_p.stdout == seq_p.stdout and par_p.stderr == seq_p.stderr,
+                  f"exit {par_p.returncode}/{seq_p.returncode}, {par_p.stdout.count(b'\n')}/{seq_p.stdout.count(b'\n')} lines")
+    # A runtime error in the middle: the same as with one thread, resuming at
+    # the document that raised it.
+    filt = 'if .i == 70000 then error("stop") else .i end'
+    seq_p = subprocess.run([sjq, "--threads", "1", "-c", filt, nd_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT)
+    par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, nd_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
+    err_at = len(b"\n".join(nd.split(b"\n")[:70000])) + 1
+    seq_err = seq_p.stderr.replace(b"\r\n", b"\n")
+    par_all = par_p.stderr.replace(b"\r\n", b"\n")
+    check("runtime error mid-stream, parallel as sequential",
+          par_p.returncode == seq_p.returncode and par_p.stdout == seq_p.stdout and seq_err in par_all
+          and f"sjq: sequential from byte {err_at}\n".encode() in par_all,
+          f"exit {par_p.returncode}/{seq_p.returncode} {par_all[-300:]!r}")
+
+    # Medium files go parallel too (from 1 MiB), with at most one thread per
+    # 512 KiB; smaller files stay sequential.
+    medium = os.path.join(tmp, "medium.ndjson")
+    with open(medium, "wb") as f:
+        f.write(nd[: nd.index(b"\n", 1536 << 10) + 1])
+    code, out, err = run([sjq, "--threads", "64", "-c", ".i", medium], env={"SJQ_DEBUG": "1"})
+    seq_code, seq_out, _ = run([sjq, "--threads", "1", "-c", ".i", medium])
+    check("medium file goes parallel, with few threads", code == 0 and out == seq_out and b"sjq: parallel (3 threads," in err,
+          f"exit {code} {err!r}")
+    small = os.path.join(tmp, "small.ndjson")
+    with open(small, "wb") as f:
+        f.write(nd[: nd.index(b"\n", 900 << 10) + 1])
+    code, _, err = run([sjq, "-c", ".i", small], env={"SJQ_DEBUG": "1"})
+    check("small file stays sequential", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
     code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"a": [1,')
-    check("truncated input", code == 5 and out == b'{"a":1}\n' and b"Unfinished" in err, f"exit {code} {out!r} {err!r}")
+    check("truncated input", code == 5 and out == b'{"a":1}\n' and b"unclosed array" in err, f"exit {code} {out!r} {err!r}")
 
     # A file that shrinks while it is read (POSIX test hook).
     if sys.platform != "win32":

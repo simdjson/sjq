@@ -1,0 +1,50 @@
+name: Packages
+
+# Keeps the Scoop manifest of this repository's bucket (bucket/sjq.json) at
+# the latest release, once the release is complete: all five binaries,
+# including the macOS one that scripts/release-macos.sh may attach later.
+# The Homebrew tap (simdjson/homebrew-tap) follows the releases the same way;
+# the winget manifests are kept as an artifact, for a pull request to
+# microsoft/winget-pkgs.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '47 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scoop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Update bucket/sjq.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          python3 scripts/package_manifests.py "$tag" "$RUNNER_TEMP/packaging"
+          if [ ! -f "$RUNNER_TEMP/packaging/scoop/sjq.json" ]; then
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/packaging/scoop/sjq.json" bucket/sjq.json
+          if git diff --quiet; then
+            echo "bucket/sjq.json is at $tag"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Scoop manifest for $tag"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests
+          path: ${{ runner.temp }}/packaging/winget
+          if-no-files-found: ignore

@@ -50,12 +50,21 @@
 - Output: our own writer that reproduces jq's formatting: 2-space indent, jq's
   string escaping (including `\u007f`), jq 1.7's number formatting for computed
   values (shortest round-trip, exponent when decpt <= -4 or decpt > digits+15).
-- Parallel NDJSON: inputs of 4 MB or more are cut into ~1 MB chunks right after
-  newlines; worker threads filter whole chunks, the main thread writes them in
-  order. A cut inside a multi-line document always makes some chunk end with an
-  incomplete document or fail to parse, at the first bad cut, so any
-  failing chunk sends the rest of the input to the sequential path. That path
-  also produces the error messages. `--threads 1` disables it, and RS-separated
+- Parallel NDJSON: inputs of 1 MiB or more are cut into chunks right after
+  newlines (about eight per thread, from 256 KiB to 1 MiB); worker threads
+  filter whole chunks, the main thread writes them in order. sjq starts at
+  most one worker per 512 KiB of input (starting one costs about as much as
+  filtering that much), and no more than there are chunks. A worker waits for
+  room in the output window before it takes a chunk, so a written chunk wakes
+  one worker, not all of them. A cut inside a multi-line document always makes
+  some chunk end with an incomplete document or fail to parse, at the first
+  bad cut. The first chunk that fails therefore starts on a document boundary
+  (the chunks before it ended cleanly), so the documents before its failure
+  are real: their output is kept, and the sequential path resumes at the
+  document that failed (an invalid document, a runtime error, or the
+  incomplete document at a bad cut). That path also produces the error
+  messages. `SJQ_DEBUG=1` prints the threads, the chunks and where the
+  sequential path resumes. `--threads 1` disables it, and RS-separated
   (`--seq`) input is always read sequentially.
 
 - On-Demand fast path (default when the filter allows it): paths, `.[]`,

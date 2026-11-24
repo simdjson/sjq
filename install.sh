@@ -6,6 +6,7 @@
 # Environment:
 #   SJQ_VERSION      a release tag such as v0.1.0 (default: the latest release)
 #   SJQ_INSTALL_DIR  where to put sjq (default: $HOME/.local/bin)
+#   SJQ_MODIFY_PATH  1: add the directory to PATH in the shell's startup file
 set -eu
 
 repo="simdjson/sjq"
@@ -67,6 +68,40 @@ fi
 
 echo "Installed $("$dir/sjq" --version) to $dir/sjq"
 case ":$PATH:" in
-  *":$dir:"*) ;;
-  *) echo "Add $dir to your PATH, for example: export PATH=\"$dir:\$PATH\"" ;;
+  *":$dir:"*) exit 0 ;;
 esac
+
+# The directory is not in PATH: the line to add, for the user's shell.
+case "$dir" in
+  "$HOME"/*) shown_dir="\$HOME/${dir#"$HOME"/}" ;;
+  *) shown_dir="$dir" ;;
+esac
+case "${SHELL:-}" in
+  */zsh) rc="$HOME/.zshrc"; line="export PATH=\"$shown_dir:\$PATH\"" ;;
+  */bash)
+    # macOS Terminal opens login shells, which read ~/.bash_profile.
+    if [ "$(uname -s)" = Darwin ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
+    line="export PATH=\"$shown_dir:\$PATH\"" ;;
+  */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path \"$shown_dir\"" ;;
+  *) rc="$HOME/.profile"; line="export PATH=\"$shown_dir:\$PATH\"" ;;
+esac
+case "$rc" in
+  "$HOME"/*) shown_rc="~/${rc#"$HOME"/}" ;;
+  *) shown_rc="$rc" ;;
+esac
+if [ "${SJQ_MODIFY_PATH:-}" = 1 ]; then
+  mkdir -p "$(dirname "$rc")"
+  if [ -f "$rc" ] && grep -qxF "$line" "$rc"; then
+    echo "$shown_rc already has: $line"
+  else
+    printf '\n%s\n' "$line" >> "$rc"
+    echo "Added to $shown_rc: $line"
+  fi
+  echo "Open a new terminal, or run: $line"
+else
+  echo "$dir is not in your PATH. To add it, run:"
+  echo
+  echo "  echo '$line' >> $shown_rc"
+  echo
+  echo "then open a new terminal (or set SJQ_MODIFY_PATH=1 when installing to have it done)."
+fi

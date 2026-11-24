@@ -34,3 +34,6 @@ mv "$work/SHA256SUMS.new" "$work/SHA256SUMS"
 cat "$work/SHA256SUMS"
 gh release upload "$tag" --repo "$repo" --clobber "$work/$asset.tar.gz" "$work/SHA256SUMS"
 git -C "$root" worktree remove --force "$work/src"
+
+# The release is complete: the package managers can follow it now.
+"$root/scripts/update_packages.sh"
