@@ -505,13 +505,16 @@ def targeted(sjq, data, tmp):
                                timeout=TIMEOUT)
         par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, bad_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
-        par_err = b"\n".join(l for l in par_p.stderr.split(b"\n") if not l.startswith(b"sjq: parallel")
+        # Windows ends the lines of standard error with CRLF.
+        seq_err = seq_p.stderr.replace(b"\r\n", b"\n")
+        par_all = par_p.stderr.replace(b"\r\n", b"\n")
+        par_err = b"\n".join(l for l in par_all.split(b"\n") if not l.startswith(b"sjq: parallel")
                              and not l.startswith(b"sjq: sequential") and not l.endswith(b" path"))
         check(f"error mid-stream, parallel as sequential ({filt})",
-              par_p.returncode == seq_p.returncode == 5 and par_p.stdout == seq_p.stdout and par_err == seq_p.stderr,
-              f"exit {par_p.returncode}/{seq_p.returncode} {par_err[-200:]!r} {seq_p.stderr[-200:]!r}")
+              par_p.returncode == seq_p.returncode == 5 and par_p.stdout == seq_p.stdout and par_err == seq_err,
+              f"exit {par_p.returncode}/{seq_p.returncode} {par_err[-200:]!r} {seq_err[-200:]!r}")
         check(f"error mid-stream resumes at the bad document ({filt})",
-              f"sjq: sequential from byte {bad_at}\n".encode() in par_p.stderr, repr(par_p.stderr[-300:]))
+              f"sjq: sequential from byte {bad_at}\n".encode() in par_all, repr(par_all[-300:]))
     # A runtime error in the middle: the same as with one thread, resuming at
     # the document that raised it.
     filt = 'if .i == 70000 then error("stop") else .i end'
@@ -519,10 +522,12 @@ def targeted(sjq, data, tmp):
     par_p = subprocess.run([sjq, "--threads", "4", "-c", filt, nd_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=TIMEOUT, env=dict(os.environ, SJQ_DEBUG="1"))
     err_at = len(b"\n".join(nd.split(b"\n")[:70000])) + 1
+    seq_err = seq_p.stderr.replace(b"\r\n", b"\n")
+    par_all = par_p.stderr.replace(b"\r\n", b"\n")
     check("runtime error mid-stream, parallel as sequential",
-          par_p.returncode == seq_p.returncode and par_p.stdout == seq_p.stdout and seq_p.stderr in par_p.stderr
-          and f"sjq: sequential from byte {err_at}\n".encode() in par_p.stderr,
-          f"exit {par_p.returncode}/{seq_p.returncode} {par_p.stderr[-300:]!r}")
+          par_p.returncode == seq_p.returncode and par_p.stdout == seq_p.stdout and seq_err in par_all
+          and f"sjq: sequential from byte {err_at}\n".encode() in par_all,
+          f"exit {par_p.returncode}/{seq_p.returncode} {par_all[-300:]!r}")
 
     # Medium files go parallel too (from 1 MiB), with at most one thread per
     # 512 KiB; smaller files stay sequential.

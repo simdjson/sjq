@@ -178,6 +178,29 @@ simdjson_never_inline node_ptr compile_or_report(const std::string &filter, cons
   }
 }
 
+// Filter one document on a worker thread and catch what the filter throws:
+// false (or -1) when it fails, and the main thread redoes the document. With
+// MinGW GCC, an exception caught in the worker, a function defined inside
+// main, crashed the unwinder about half the time (as in compile_or_report).
+simdjson_never_inline bool eval_on_worker(const node &prog, const value &in, const env_ptr &e, emit_ref out) noexcept {
+  try {
+    prog.eval(in, e, out);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// 1: filtered, 0: the document needs the DOM path, -1: the filter failed.
+simdjson_never_inline int od_on_worker(od_expr &plan, ondemand::document_reference &doc, writer &w, bool raw, bool join,
+                                       bool seq) noexcept {
+  try {
+    return od_run_doc(plan, doc, w, raw, join, seq) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
 int main(int argc, char **argv) {
   stack_guard_init(main_stack_budget());
   writer w{};
@@ -854,11 +877,13 @@ int main(int argc, char **argv) {
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                if (od_run_doc(*plan, doc, lw, raw, join, seq)) { continue; }
+                int od = od_on_worker(*plan, doc, lw, raw, join, seq);
+                if (od == 1) { continue; }
+                if (od < 0) { ok = false; break; }
                 std::string_view src = it.source();
                 dom::element el;
                 if (local_parser.parse(src.data(), src.size(), true).get(el)) { ok = false; break; }
-                prog->eval(value::of(el), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(el), root_env, lemit)) { ok = false; break; }
               }
               if (ok && ostream.truncated_bytes()) {
                 ok = false;
@@ -877,7 +902,7 @@ int main(int argc, char **argv) {
                 auto err = (*it).get(doc);
                 if (err == EMPTY) { break; }
                 if (err || g_input_changed.load()) { ok = false; break; }
-                prog->eval(value::of(doc), root_env, lemit);
+                if (!eval_on_worker(*prog, value::of(doc), root_env, lemit)) { ok = false; break; }
               }
               if (ok && stream.truncated_bytes()) {
                 ok = false;
