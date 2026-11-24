@@ -12,8 +12,8 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and they usually run ten to a hundred times
-faster on large inputs. sjq parses JSON with simdjson's SIMD instructions,
+write for jq work with sjq, and on large inputs they run ten to almost two
+hundred times faster. sjq parses JSON with simdjson's SIMD instructions,
 reads only the parts of a document a filter needs when it can, maps files in
 memory instead of copying them, and filters large newline-delimited files on
 all cores.
@@ -211,8 +211,9 @@ hyperfine runs (3 for jq, 10 for sjq), with the output written to
 `/dev/null`; the outputs of jq and sjq were checked to be identical. "sjq" is
 the default (all cores on large newline-delimited files);
 "sjq --threads 1" is sequential. The machine has two sockets, and the time of
-a run on one core depends on the socket it lands on (up to 25%): the
-single-document runs of all three tools are pinned to the same socket.
+a run on one core depends on the socket it lands on (up to 25%): every run on
+one thread (jq, "sjq --threads 1", and sjq on the single document) is pinned
+to the same socket.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench-ndjson-dark.svg">
@@ -229,7 +230,7 @@ single-document runs of all three tools are pinned to the same socket.
 These workloads show where sjq is strongest: large inputs, whose parsing
 dominates. Even sequential, sjq is twelve to forty times faster than jq here;
 on large newline-delimited files, its worker threads add another factor of
-three to eight. Filters with regular expressions run on one thread. A single
+five to nine. Filters with regular expressions run on one thread. A single
 large document is parsed by one thread. Filters that compute a lot on small
 inputs gain less. To reproduce the
 numbers, see [`bench/`](https://github.com/simdjson/sjq/tree/main/bench).

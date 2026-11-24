@@ -10,8 +10,8 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and on large inputs they run ten to a hundred
-times faster. Documentation: **https://simdjson.github.io/sjq/**
+write for jq work with sjq, and on large inputs they run ten to almost two
+hundred times faster. Documentation: **https://simdjson.github.io/sjq/**
 
 ## Install
 
