@@ -21,9 +21,19 @@ HOMEPAGE = "https://simdjson.github.io/sjq/"
 HOMEBREW_DESCRIPTION = "JSON processor compatible with jq, built on simdjson"
 
 
+def fetch(url):
+    """Opens a URL; GitHub API calls carry GH_TOKEN or GITHUB_TOKEN when one
+    is set (anonymous calls from CI runners hit the rate limit)."""
+    req = urllib.request.Request(url)
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        req.add_header("Authorization", f"Bearer {token}")
+    return urllib.request.urlopen(req)
+
+
 def checksums(tag):
     url = f"https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS"
-    with urllib.request.urlopen(url) as r:
+    with fetch(url) as r:
         lines = r.read().decode().splitlines()
     sums = {}
     for line in lines:
@@ -34,7 +44,7 @@ def checksums(tag):
 
 def release_date(tag):
     url = f"https://api.github.com/repos/{REPO}/releases/tags/{tag}"
-    with urllib.request.urlopen(url) as r:
+    with fetch(url) as r:
         return json.load(r)["published_at"][:10]
 
 
