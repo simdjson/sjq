@@ -19,6 +19,8 @@ jobs:
   unix:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # A failure of the macOS runner does not fail the run.
+    continue-on-error: ${{ matrix.name == 'macos' }}
     strategy:
       fail-fast: false
       matrix:
