@@ -764,8 +764,8 @@ int main(int argc, char **argv) {
     return len;
   };
 
-  // Parallel processing: the input is cut into chunks of about 256 KiB right
-  // after newlines, and each worker filters whole chunks into its own buffer;
+  // Parallel processing: the input is cut into chunks of 256 KiB to 1 MiB
+  // right after newlines, and each worker filters whole chunks into its own buffer;
   // the main thread writes the buffers in order. A cut inside a document makes
   // the chunk before it end with an incomplete document (or an error), and so
   // does the first bad cut. So the first chunk that fails starts on a document
@@ -774,9 +774,11 @@ int main(int argc, char **argv) {
   // resumes at the document that failed. It also reports errors like jq.
   // Returns the offset where sequential processing must resume.
   auto run_parallel = [&](const input_source &input) -> size_t {
-    // Small chunks balance the work at the end of the input; 256 KiB keeps
-    // the cost of a chunk (a stream to set up, a buffer to hand over) small.
-    const size_t chunk_target = size_t(256) << 10;
+    // Small chunks balance the work at the end of the input, but each costs
+    // a stream to set up and a buffer to hand over: about eight chunks per
+    // thread, from 256 KiB to 1 MiB.
+    const size_t chunk_target =
+        std::min<size_t>(size_t(1) << 20, std::max<size_t>(size_t(256) << 10, input.size() / (size_t(threads) * 8)));
     std::vector<size_t> starts;
     for (size_t pos = 0; pos < input.size();) {
       starts.push_back(pos);
@@ -797,7 +799,8 @@ int main(int argc, char **argv) {
     std::vector<slot> slots(n);
     std::mutex mu;
     std::condition_variable cv_done, cv_window;
-    std::atomic<size_t> next{0};
+    size_t next = 0;           // the next chunk to take (guarded by mu)
+    size_t writer_waits = n;   // the chunk the main thread waits for (guarded by mu)
     std::atomic<bool> abort{false};
     size_t flushed = 0;
     // Starting a worker costs about as much as filtering 512 KiB: at most one
@@ -822,12 +825,16 @@ int main(int argc, char **argv) {
         else if (!join) { lw.put('\n'); }
       };
       while (true) {
-        size_t k = next.fetch_add(1);
-        if (k >= n) { return; }
+        // A worker waits for room in the window before it takes a chunk, so
+        // that any waiting worker can take the room a written chunk frees:
+        // one is woken, not all of them.
+        size_t k;
         {
           std::unique_lock<std::mutex> lock(mu);
-          cv_window.wait(lock, [&] { return k < flushed + window || abort.load(); });
+          cv_window.wait(lock, [&] { return next >= n || next < flushed + window || abort.load(); });
+          k = next++;
         }
+        if (k >= n) { return; }
         bool ok = !abort.load();
         size_t len = starts[k + 1] - starts[k];
         const uint8_t *cbuf = reinterpret_cast<const uint8_t *>(input.data() + starts[k]);
@@ -889,14 +896,16 @@ int main(int argc, char **argv) {
         }
         std::string out;
         out.swap(lw.buf);
+        bool wake_writer;
         {
           std::lock_guard<std::mutex> lock(mu);
           slots[k].out = std::move(out);
           slots[k].resume = keep;
           slots[k].ok = ok;
           slots[k].done = true;
+          wake_writer = writer_waits == k;
         }
-        cv_done.notify_all();
+        if (wake_writer) { cv_done.notify_one(); }
       }
     };
     std::vector<std::thread> pool;
@@ -909,14 +918,21 @@ int main(int argc, char **argv) {
       size_t at;
       {
         std::unique_lock<std::mutex> lock(mu);
+        writer_waits = k;
         cv_done.wait(lock, [&] { return slots[k].done; });
+        writer_waits = n;
         out.swap(slots[k].out);
         ok = slots[k].ok;
         at = slots[k].resume;
         if (!ok) { abort = true; }
         flushed = k + 1;
       }
-      cv_window.notify_all();
+      // One more chunk fits in the window; after a failure, all workers stop.
+      if (ok) {
+        cv_window.notify_one();
+      } else {
+        cv_window.notify_all();
+      }
       fwrite(out.data(), 1, out.size(), w.out);
       if (flush_each) { fflush(w.out); }
       if (!ok) {
@@ -925,6 +941,13 @@ int main(int argc, char **argv) {
         break;
       }
     }
+    // Workers still waiting for room see that every chunk is taken (or the
+    // abort) and return.
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      abort = true;
+    }
+    cv_window.notify_all();
     for (auto &t : pool) { t.join(); }
     return resume;
   };
