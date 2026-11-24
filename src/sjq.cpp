@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
   std::string filter{};
   bool have_filter = false;
   std::string filter_file{};
-  std::string output_file{};
+  std::string output_file_name{};
   std::vector<std::string> files{};
   // --arg and friends: the variables, in order, and $ARGS.
   std::vector<std::pair<std::string, value>> named{};
@@ -285,7 +285,7 @@ int main(int argc, char **argv) {
     else if (a == "--args") { rest_mode = 1; }
     else if (a == "--jsonargs") { rest_mode = 2; }
     else if (a == "--fractured") { w.fractured = true; }
-    else if (a == "-o" || a == "--output") { need(i, 1, a); output_file = argv[++i]; }
+    else if (a == "-o" || a == "--output") { need(i, 1, a); output_file_name = argv[++i]; }
     else if (a == "--width") {
       need(i, 1, a);
       char *endp = nullptr;
@@ -357,8 +357,8 @@ int main(int argc, char **argv) {
   static std::string colors[C_COUNT];
   const char *no_color = getenv("NO_COLOR");
   // -o FILE: opened once the filter compiles (see below).
-  FILE *output = nullptr;
-  const bool terminal = output_file.empty() && stdout_is_terminal();
+  output_file output{};
+  const bool terminal = output_file_name.empty() && stdout_is_terminal();
   const bool can_color = prepare_console(binary);
   // The FracturedJson layout has no colors.
   w.color = !w.fractured && (color_mode == 1 || (color_mode == -1 && terminal && can_color && !(no_color && *no_color)));
@@ -377,24 +377,18 @@ int main(int argc, char **argv) {
 
   // -o FILE: sjq writes the file itself (in UTF-8, with LF line ends), so
   // that the shell does not re-encode the output (Windows PowerShell 5's >
-  // writes UTF-16). The output goes to an anonymous temporary file (gone
-  // when sjq ends, even when interrupted), copied into FILE at the end of a
-  // successful run. FILE can then also be an input (sjq -o data.json ...
-  // data.json), a failed run leaves it as it was, and FILE is written as the
-  // shell's > writes it: through a symbolic link, keeping its permissions,
-  // owner, links and ACLs.
-  if (!output_file.empty()) {
-    std::string why = output_problem(output_file);
+  // writes UTF-16). The output goes to a temporary file that replaces FILE
+  // at the end of a successful run (see output_file): FILE can also be an
+  // input (sjq -o data.json ... data.json), and a failed run leaves it as it
+  // was.
+  if (!output_file_name.empty()) {
+    std::string why = output_problem(output_file_name);
+    if (why.empty()) { open_output(output_file_name, output, why); }
     if (!why.empty()) {
-      fprintf(stderr, "sjq: error: cannot write %s: %s\n", output_file.c_str(), why.c_str());
+      fprintf(stderr, "sjq: error: cannot write %s: %s\n", output_file_name.c_str(), why.c_str());
       return 2;
     }
-    output = anonymous_temporary_file();
-    if (!output) {
-      fprintf(stderr, "sjq: error: cannot create a temporary file for %s: %s\n", output_file.c_str(), strerror(errno));
-      return 2;
-    }
-    w.out = output;
+    w.out = output.f;
   }
   // The variables of --arg and friends, and $ARGS.
   env_ptr root_env{};
@@ -438,32 +432,37 @@ int main(int argc, char **argv) {
     if (!exit_status || st != 0) { return st; }
     return last_output < 0 ? 4 : (last_output == 0 ? 1 : 0);
   };
-  // -o: copies the temporary file into the target (keep), or drops it.
-  // Returns false when the target could not be written.
+  // -o: puts the output in place (keep), or drops it. Returns false when
+  // the file could not be written.
   auto close_output = [&](bool keep) {
-    if (!output) { return true; }
-    FILE *tmp = output;
-    output = nullptr;
+    if (!output.f) { return true; }
     if (!keep) {
-      fclose(tmp);
-      fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file.c_str());
+      discard_output(output);
+      fprintf(stderr, "sjq: %s was not changed (the run failed)\n", output_file_name.c_str());
       return true;
     }
     std::string why;
-    bool ok = fflush(tmp) == 0 && !ferror(tmp) && copy_into_file(tmp, output_file, why);
-    fclose(tmp);
-    if (!ok) { fprintf(stderr, "sjq: error: could not write %s: %s\n", output_file.c_str(), why.c_str()); }
-    return ok;
+    if (commit_output(output, why)) { return true; }
+    fprintf(stderr, "sjq: error: could not write %s: %s (it was not changed)\n", output_file_name.c_str(), why.c_str());
+    return false;
   };
-  // Writes what is left and checks that the output file was written.
+  // Writes what is left, puts the output in place and returns the exit
+  // status.
   auto finish = [&](int st) {
     w.flush();
-    if (halted) { return close_output(true) ? halt_status : 2; }
     int fs = final_status(st);
-    // With -e, the statuses 1 and 4 describe the output: the run succeeded
-    // when no error happened.
-    bool success = !any_error && !file_error && (fs == 0 || (exit_status && (fs == 1 || fs == 4)));
-    if (!close_output(success)) { return 2; }
+    if (halted) {
+      // As jq: an input that could not be read (2) or parsed (5) wins over
+      // the status of halt.
+      fs = file_error ? 2 : (parse_error ? 5 : halt_status);
+    }
+    bool clean = !any_error && !file_error && !parse_error;
+    // With -e, the statuses 1 and 4 describe the output.
+    bool output_status = fs == 0 || (exit_status && (fs == 1 || fs == 4));
+    if (halted && clean) { output_status = true; }
+    if (!close_output(clean && output_status)) { return 2; }
+    // A dropped -o output is a failure, whatever the last input did.
+    if (!output_file_name.empty() && !clean && output_status) { return 5; }
     return fs;
   };
 
@@ -629,6 +628,10 @@ int main(int argc, char **argv) {
   // under sjq from errors in the input.
   const input_source *current = nullptr;
   auto input_changed = [&]() { return current && current->changed(); };
+  // The largest parse batch (at least 1 MB). SJQ_TEST_BATCH (bytes) lowers
+  // it for the tests, so that a small file spans several batches.
+  size_t max_batch = size_t(64) << 20;
+  if (const char *tb = getenv("SJQ_TEST_BATCH")) { max_batch = std::max<size_t>(1, strtoull(tb, nullptr, 10)); }
   bool fatal = false;  // a parse error ends the input, as in jq
 
   // The message for invalid JSON in data[start, len): where the first problem
@@ -651,7 +654,7 @@ int main(int argc, char **argv) {
   auto run_sequential = [&](const char *data, size_t len, size_t offset, bool at_eof, stream_format fmt, const char *name) -> size_t {
     // If a document does not fit in a batch, the stream restarts there with a
     // larger batch.
-    size_t batch = std::max<size_t>(size_t(1) << 20, std::min<size_t>(len - offset, size_t(64) << 20));
+    size_t batch = std::max<size_t>(size_t(1) << 20, std::min<size_t>(len - offset, max_batch));
     while (offset < len) {
       size_t slen = len - offset;
       const uint8_t *sbuf = reinterpret_cast<const uint8_t *>(data + offset);
@@ -709,7 +712,7 @@ int main(int argc, char **argv) {
             }
             run(value::of(el), name);
             if (halted) {
-              fatal = true;
+              failed = fatal = true;
               break;
             }
           }
@@ -737,7 +740,7 @@ int main(int argc, char **argv) {
           doc_end = end;
           run(value::of(doc), name);
           if (halted) {
-            fatal = true;
+            failed = fatal = true;
             break;
           }
           if (flush_each) { w.flush(); } else { w.maybe_flush(); }

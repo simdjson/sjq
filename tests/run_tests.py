@@ -318,7 +318,12 @@ def targeted(sjq, data, tmp):
     code, _, err = run([sjq, "-o", dpath, 'if .==1 then error("x") else . end', two])
     with open(dpath, "rb") as f:
         kept = f.read()
-    check("-o keeps the file after an error on an earlier input", kept == b'{"c":1}\n', f"exit {code} {kept!r} {err!r}")
+    check("-o keeps the file after an error on an earlier input, exit 5", code == 5 and kept == b'{"c":1}\n',
+          f"exit {code} {kept!r} {err!r}")
+    code, _, err = run([sjq, "-o", dpath, 'if .==1 then error("x") else halt end', two])
+    with open(dpath, "rb") as f:
+        kept = f.read()
+    check("-o keeps the file after an error, then halt", code == 5 and kept == b'{"c":1}\n', f"exit {code} {kept!r}")
     badj = os.path.join(tmp, "bad-array.json")
     with open(badj, "wb") as f:
         f.write(b"[1,\n")
@@ -456,6 +461,14 @@ def targeted(sjq, data, tmp):
     check("--fractured parallel and sequential", code1 == 0 and code2 == 0 and out1 == out2 and out1.startswith(b'{ "i": 0, "a": [0, 0], "o": {"k": "0"} }\n'),
           f"exit {code1} {code2} {out1[:80]!r} {out2[:80]!r}")
 
+    # halt in a file larger than a parse batch: sjq used to read the state of
+    # the stream after stopping early. SJQ_TEST_BATCH makes the batch 1 MB.
+    for threads in ("1", "4"):
+        p = subprocess.run([sjq, "--threads", threads, "-c", 'if .i == 100000 then halt_error(7) else empty end', nd_path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT,
+                           env=dict(os.environ, SJQ_TEST_BATCH=str(1 << 20)))
+        check(f"halt_error in a file larger than a batch (--threads {threads})", p.returncode == 7,
+              f"exit {p.returncode} {p.stderr[-300:]!r}")
     opath2 = os.path.join(tmp, "parallel-out.json")
     code, _, err = run([sjq, "-c", "-o", opath2, ".o", nd_path])
     with open(opath2, "rb") as f:

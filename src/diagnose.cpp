@@ -273,7 +273,13 @@ std::string plain_error(simdjson::error_code err) {
   case EMPTY: return "no JSON value";
   case TRAILING_CONTENT: return "unexpected content after the JSON value";
   case IO_ERROR: return "cannot read the input";
-  default: return error_message(err);
+  default: {
+    // simdjson's messages start with the name of the code ("TAPE_ERROR: ...").
+    std::string m = error_message(err);
+    size_t colon = m.find(": ");
+    if (colon != std::string::npos && colon < 40 && m.find(' ') > colon) { m.erase(0, colon + 2); }
+    return m;
+  }
   }
 }
 

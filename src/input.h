@@ -42,13 +42,25 @@ private:
 // -o FILE. Why FILE cannot be written (empty when it can), checked before
 // the run without changing FILE.
 std::string output_problem(const std::string &fname);
-// A temporary file without a name, opened for reading and writing, which
-// disappears when it is closed or when sjq ends.
-FILE *anonymous_temporary_file();
-// Copies the content of tmp into FILE, opened as the shell's > opens it
-// (through a symbolic link, keeping the permissions, owner, links and ACLs
-// of an existing file); false with the reason in why when it cannot.
-bool copy_into_file(FILE *tmp, const std::string &fname, std::string &why);
+// The output of -o FILE: a temporary file next to the real FILE (symbolic
+// links followed), created exclusively with the permissions and owner of
+// FILE, then renamed over it (ReplaceFileW on Windows, which keeps the ACLs).
+// The replacement is atomic; a hard link to FILE keeps the old content. A
+// device or a pipe (/dev/null, NUL) is written directly.
+struct output_file {
+  FILE *f{nullptr};
+#if defined(_WIN32)
+  std::wstring wtmp{}, wtarget{};
+#else
+  std::string tmp{}, target{};
+#endif
+};
+bool open_output(const std::string &fname, output_file &out, std::string &why);
+// Puts the output in place; false with the reason in why when it cannot
+// (FILE is then unchanged).
+bool commit_output(output_file &out, std::string &why);
+// Drops the output: FILE is unchanged.
+void discard_output(output_file &out);
 
 // Why a file cannot be read ("No such file or directory", ...).
 std::string open_failure_reason(const std::string &fname);
