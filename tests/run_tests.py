@@ -15,6 +15,7 @@ Usage: run_tests.py --sjq PATH [--data DIR] [--jq PATH] [--group NAME]...
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -430,20 +431,20 @@ def targeted(sjq, data, tmp):
         f.write(nd)
     want = "".join(json.dumps(d["o"], separators=(",", ":")) + "\n" for d in docs).encode()
     for label, argv, stdin in (
-        ("parallel", [sjq, "-c", ".o", nd_path], b""),
+        ("parallel", [sjq, "-P", "-c", ".o", nd_path], b""),
         ("sequential", [sjq, "--threads", "1", "-c", ".o", nd_path], b""),
-        ("no-mmap", [sjq, "--no-mmap", "-c", ".o", nd_path], b""),
-        ("pipe", [sjq, "-c", ".o"], nd),
+        ("no-mmap", [sjq, "-P", "--no-mmap", "-c", ".o", nd_path], b""),
+        ("pipe", [sjq, "-P", "-c", ".o"], nd),
     ):
         code, out, _ = run(argv, stdin)
         check(f"ndjson {label}", code == 0 and out == want, f"exit {code}, {len(out)} bytes")
     # --raw-output0 on the parallel path and sequentially.
     want0 = "".join(str(d["i"]) + "\0" for d in docs).encode()
-    for label, extra in (("parallel", []), ("sequential", ["--threads", "1"])):
+    for label, extra in (("parallel", ["-P"]), ("sequential", ["--threads", "1"])):
         code, out, _ = run([sjq] + extra + ["--raw-output0", ".i | tostring", nd_path])
         check(f"--raw-output0 {label}", code == 0 and out == want0, f"exit {code}, {out.count(b'\0')} NULs, {out.count(b'\n')} newlines")
     with open(nd_path, "rb") as f:
-        p = subprocess.run([sjq, "-c", ".o"], stdin=f, stdout=subprocess.PIPE, timeout=TIMEOUT)
+        p = subprocess.run([sjq, "-P", "-c", ".o"], stdin=f, stdout=subprocess.PIPE, timeout=TIMEOUT)
     check("ndjson redirected stdin", p.returncode == 0 and norm(p.stdout) == want)
 
     # Pretty-printed documents: the parallel cuts land inside documents.
@@ -452,11 +453,11 @@ def targeted(sjq, data, tmp):
     with open(pretty_path, "wb") as f:
         f.write(pretty)
     want_c = "".join(json.dumps(d, separators=(",", ":")) + "\n" for d in docs[:40000]).encode()
-    code, out, _ = run([sjq, "-c", ".", pretty_path])
+    code, out, _ = run([sjq, "-P", "-c", ".", pretty_path])
     check("pretty stream parallel fallback", code == 0 and out == want_c, f"exit {code}")
 
     # --fractured: the same output from the worker threads and sequentially.
-    code1, out1, _ = run([sjq, "--fractured", "{i, a, o}", nd_path])
+    code1, out1, _ = run([sjq, "-P", "--fractured", "{i, a, o}", nd_path])
     code2, out2, _ = run([sjq, "--threads", "1", "--fractured", "{i, a, o}", nd_path])
     check("--fractured parallel and sequential", code1 == 0 and code2 == 0 and out1 == out2 and out1.startswith(b'{ "i": 0, "a": [0, 0], "o": {"k": "0"} }\n'),
           f"exit {code1} {code2} {out1[:80]!r} {out2[:80]!r}")
@@ -470,22 +471,46 @@ def targeted(sjq, data, tmp):
         check(f"halt_error in a file larger than a batch (--threads {threads})", p.returncode == 7,
               f"exit {p.returncode} {p.stderr[-300:]!r}")
     opath2 = os.path.join(tmp, "parallel-out.json")
-    code, _, err = run([sjq, "-c", "-o", opath2, ".o", nd_path])
+    code, _, err = run([sjq, "-P", "-c", "-o", opath2, ".o", nd_path])
     with open(opath2, "rb") as f:
         written = f.read()
     check("-o on the parallel path", code == 0 and written == want, f"exit {code}, {len(written)} bytes {err!r}")
 
     # Only newline-delimited input goes to the worker threads: one large
     # pretty-printed document, or pretty-printed documents, stay sequential.
-    code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1"})
+    code, _, err = run([sjq, "-P", "-c", ".i", nd_path], env={"SJQ_DEBUG": "1"})
     check("parallel path for NDJSON", code == 0 and b"sjq: parallel" in err, f"exit {code} {err!r}")
+    # The thread count: --threads n, then -P (at most 32), then SJQ_THREADS,
+    # then one thread; 0 is every available CPU.
+    code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1", "SJQ_THREADS": ""})
+    check("sequential by default", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
+    for flags in (["-P"], ["--parallel"], ["-cP"]):
+        code, _, err = run([sjq] + flags + ["-c", ".i", nd_path], env={"SJQ_DEBUG": "1", "SJQ_THREADS": "3"})
+        m = re.search(rb"sjq: parallel \((\d+) threads", err)
+        check(f"{flags[0]} takes at most 32 threads", code == 0 and (os.cpu_count() == 1 or (m and 2 <= int(m.group(1)) <= 32)),
+              f"exit {code} {err!r}")
+    code, _, err = run([sjq, "--threads", "2", "-P", "-c", ".i", nd_path], env={"SJQ_DEBUG": "1"})
+    check("--threads overrides -P", code == 0 and b"sjq: parallel (2 threads" in err, f"exit {code} {err!r}")
+    code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1", "SJQ_THREADS": "3"})
+    check("SJQ_THREADS", code == 0 and b"sjq: parallel (3 threads" in err, f"exit {code} {err!r}")
+    code, _, err = run([sjq, "--threads", "2", "-c", ".i", nd_path], env={"SJQ_DEBUG": "1", "SJQ_THREADS": "3"})
+    check("--threads overrides SJQ_THREADS", code == 0 and b"sjq: parallel (2 threads" in err, f"exit {code} {err!r}")
+    code, _, err = run([sjq, "-c", ".i", nd_path], env={"SJQ_DEBUG": "1", "SJQ_THREADS": "1"})
+    check("SJQ_THREADS=1 is sequential", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
+    code, out, _ = run([sjq, "--threads", "0", "-c", ".o", nd_path])
+    check("--threads 0", code == 0 and out == want, f"exit {code}")
+    for bad in ("x", "-1", "2x", ""):
+        code, _, err = run([sjq, "--threads", bad, ".", nd_path])
+        check(f"--threads {bad!r} is an error", code == 2 and b"--threads takes a number" in err, f"exit {code} {err!r}")
+    code, _, err = run([sjq, ".", nd_path], env={"SJQ_THREADS": "many"})
+    check("bad SJQ_THREADS is an error", code == 2 and b"SJQ_THREADS" in err, f"exit {code} {err!r}")
     one_doc = os.path.join(tmp, "one.json")
     with open(one_doc, "w") as f:
         json.dump({"docs": docs[:40000]}, f, indent=2)
-    code, out, err = run([sjq, ".docs | length", one_doc], env={"SJQ_DEBUG": "1"})
+    code, out, err = run([sjq, "-P", ".docs | length", one_doc], env={"SJQ_DEBUG": "1"})
     check("no parallel path for one large document", code == 0 and out == b"40000\n" and b"sjq: parallel" not in err,
           f"exit {code} {out!r} {err!r}")
-    code, _, err = run([sjq, "-c", ".", pretty_path], env={"SJQ_DEBUG": "1"})
+    code, _, err = run([sjq, "-P", "-c", ".", pretty_path], env={"SJQ_DEBUG": "1"})
     check("no parallel path for pretty-printed documents", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
 
     # An error in the middle stops the output there.
@@ -494,7 +519,7 @@ def targeted(sjq, data, tmp):
     bad_path = os.path.join(tmp, "bad.ndjson")
     with open(bad_path, "wb") as f:
         f.write(bad_doc)
-    code, out, _ = run([sjq, "-c", ".i", bad_path])
+    code, out, _ = run([sjq, "-P", "-c", ".i", bad_path])
     check("error mid-stream", code == 5 and out.count(b"\n") == 60000, f"exit {code}, {out.count(chr(10).encode())} lines")
     # The parallel path keeps the output of the failing chunk's documents
     # before the error, and the sequential path resumes at the bad document:
@@ -557,7 +582,7 @@ def targeted(sjq, data, tmp):
     small = os.path.join(tmp, "small.ndjson")
     with open(small, "wb") as f:
         f.write(nd[: nd.index(b"\n", 900 << 10) + 1])
-    code, _, err = run([sjq, "-c", ".i", small], env={"SJQ_DEBUG": "1"})
+    code, _, err = run([sjq, "-P", "-c", ".i", small], env={"SJQ_DEBUG": "1"})
     check("small file stays sequential", code == 0 and b"sjq: parallel" not in err, f"exit {code} {err!r}")
     code, out, err = run([sjq, "-c", "."], b'{"a":1}\n{"a": [1,')
     check("truncated input", code == 5 and out == b'{"a":1}\n' and b"unclosed array" in err, f"exit {code} {out!r} {err!r}")

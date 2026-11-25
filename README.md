@@ -10,8 +10,9 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and on large inputs they run ten to almost two
-hundred times faster. Documentation: **https://simdjson.github.io/sjq/**
+write for jq work with sjq, and on large inputs they run ten to forty times
+faster on one thread, and up to 240 times faster with `-P` (several threads)
+on large newline-delimited files. Documentation: **https://simdjson.github.io/sjq/**
 
 ## Install
 
@@ -73,7 +74,8 @@ jq does.
 ## Performance
 
 sjq against jq 1.8.2 on 1 GB of NDJSON and on one 840 MB document (mean wall
-time, outputs identical; the [documentation](https://simdjson.github.io/sjq/#performance)
+time, outputs identical; "sjq" runs on one thread, the default, and "sjq -P"
+on up to 32 threads; the [documentation](https://simdjson.github.io/sjq/#performance)
 has the method and the table).
 
 <picture>

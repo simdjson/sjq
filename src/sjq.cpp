@@ -19,7 +19,68 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 using namespace sjq;
+
+// The CPUs this process may run on. On Linux, std::thread::hardware_concurrency
+// counts every CPU of the machine: it ignores the affinity mask (taskset,
+// numactl) and the CPU quota of a container (cgroup v2 cpu.max), so sjq would
+// start a thread per CPU of the host in a container limited to two.
+static int available_cpus() {
+  int n = int(std::thread::hardware_concurrency());
+#ifdef __linux__
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) { n = CPU_COUNT(&set); }
+  // The quota of our cgroup and of its ancestors: "max 100000" (none) or
+  // "200000 100000" (two CPUs).
+  std::string path{};
+  if (FILE *f = fopen("/proc/self/cgroup", "r")) {
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+      if (strncmp(line, "0::", 3) == 0) {
+        path = line + 3;
+        while (!path.empty() && (path.back() == '\n' || path.back() == '/')) { path.pop_back(); }
+      }
+    }
+    fclose(f);
+  }
+  for (;;) {
+    if (FILE *f = fopen(("/sys/fs/cgroup" + path + "/cpu.max").c_str(), "r")) {
+      char quota[32];
+      long long period = 0;
+      if (fscanf(f, "%31s %lld", quota, &period) == 2 && strcmp(quota, "max") != 0 && period > 0) {
+        long long q = atoll(quota);
+        if (q > 0) { n = int(std::min<long long>(n, (q + period - 1) / period)); }
+      }
+      fclose(f);
+    }
+    if (path.empty()) { break; }
+    path.resize(path.rfind('/') == std::string::npos ? 0 : path.rfind('/'));
+  }
+#endif
+  return std::max(1, n);
+}
+
+// sjq runs on one thread unless asked (-P, --threads or SJQ_THREADS). With -P,
+// it takes the available CPUs up to 32: past that the parallel path gains
+// nothing (the main thread writes every output, and memory bandwidth runs out).
+// On a 64-core Xeon, 32 threads minify a 1 GiB file 12.7 times faster than
+// one, 128 threads only 8.4 times, with three times the CPU time.
+// --threads 0 (or SJQ_THREADS=0) takes every available CPU.
+static constexpr int PARALLEL_MAX_THREADS = 32;
+
+// --threads and SJQ_THREADS: a number of threads, 0 for every available CPU, -1
+// if the text is not a number.
+static int parse_threads(const char *s) {
+  char *endp = nullptr;
+  errno = 0;
+  long n = strtol(s, &endp, 10);
+  if (endp == s || *endp || errno || n < 0) { return -1; }
+  return n == 0 ? available_cpus() : int(std::min<long>(n, 1 << 16));
+}
 
 static void usage(FILE *f) {
   fprintf(f,
@@ -53,7 +114,9 @@ static void usage(FILE *f) {
           "      --seq                 write an RS before each output; read RS-separated input\n"
           "      --unbuffered          flush after each input\n"
           "  -b, --binary              on Windows, write LF line ends (no CR)\n"
-          "      --threads n           worker threads for large files (1: sequential)\n"
+          "  -P, --parallel            filter large files on several threads (the available CPUs, up to 32)\n"
+          "      --threads n           worker threads for large files (1: sequential, the default unless\n"
+          "                            SJQ_THREADS is set; 0: every available CPU)\n"
           "      --no-od               do not use the On-Demand fast path (check all the input)\n"
           "      --no-mmap             read files instead of mapping them\n"
           "  -V, --version\n"
@@ -207,7 +270,8 @@ int main(int argc, char **argv) {
   bool raw = false, join = false, null_input = false, seq = false, unbuffered = false, binary = false;
   bool slurp = false, raw_input = false, exit_status = false, raw0 = false;
   int color_mode = -1;  // -1: when stdout is a terminal
-  int threads = int(std::max(1u, std::thread::hardware_concurrency()));
+  int threads = 0;  // 0: from -P, SJQ_THREADS or the default, after the options
+  bool parallel = false;
   bool use_od = true, use_mmap = true;
   std::string filter{};
   bool have_filter = false;
@@ -333,10 +397,12 @@ int main(int argc, char **argv) {
     else if (a == "--no-mmap") { use_mmap = false; }
     else if (a == "--threads") {
       if (i + 1 >= argc) { fprintf(stderr, "sjq: --threads takes one parameter\n"); return 2; }
-      threads = std::max(1, atoi(argv[++i]));
+      threads = parse_threads(argv[++i]);
+      if (threads < 0) { fprintf(stderr, "sjq: --threads takes a number (0: every CPU)\n"); return 2; }
     }
+    else if (a == "--parallel") { parallel = true; }
     else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
-    else if (a[1] != '-' && a.find_first_not_of("crjnSMCbsRea", 1) == std::string::npos) {
+    else if (a[1] != '-' && a.find_first_not_of("crjnSMCbsReaP", 1) == std::string::npos) {
       // Combined short flags such as -rc.
       for (size_t j = 1; j < a.size(); j++) {
         switch (a[j]) {
@@ -352,6 +418,7 @@ int main(int argc, char **argv) {
         case 'R': raw_input = true; break;
         case 'e': exit_status = true; break;
         case 'a': w.ascii = true; break;
+        case 'P': parallel = true; break;
         }
       }
     }
@@ -421,6 +488,18 @@ int main(int argc, char **argv) {
   // With -e, the exit status depends on the last output: the outputs must be
   // seen in order, by the main thread. Regular expressions recurse deeply in
   // std::regex: they stay on the main thread with its large stack.
+  // --threads n, then -P, then SJQ_THREADS, then one thread.
+  if (threads == 0) {
+    const char *env = getenv("SJQ_THREADS");
+    if (parallel) {
+      threads = std::min(available_cpus(), PARALLEL_MAX_THREADS);
+    } else if (env && *env) {
+      threads = parse_threads(env);
+      if (threads < 0) { fprintf(stderr, "sjq: SJQ_THREADS must be a number (0: every CPU)\n"); return 2; }
+    } else {
+      threads = 1;
+    }
+  }
   if (exit_status || info.uses_regex) { threads = 1; }
   od_ptr plan{};
   if (use_od && !w.sort_keys && !w.ascii && !raw0 && !exit_status && !w.fractured) { plan = od_compile(prog.get()); }

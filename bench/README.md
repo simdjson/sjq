@@ -15,7 +15,7 @@ hyperfine 2.0.
 
 On a machine with several sockets, a run on one core is up to 25% faster on
 the socket whose memory holds the file: `PIN_DOCUMENT` pins every run on one
-thread (jq, `sjq --threads 1`, and sjq on the single document) to one socket
+thread (jq, sjq without `-P`, and `sjq -P` on the single document) to one socket
 (here, the odd CPUs). `ONLY="07 08 09"` reruns some workloads and keeps the
 other results. `SKIP_JQ=1` times sjq only and keeps jq's results: they stay
 valid only on the same machine, with the same data, jq and pinning (the
