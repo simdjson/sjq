@@ -12,11 +12,12 @@ sjq '.statuses[] | {id, name: .user.name}' twitter.json
 ```
 
 sjq reads the [jq language](https://jqlang.org/manual/): the filters you
-write for jq work with sjq, and on large inputs they run ten to almost two
-hundred times faster. sjq parses JSON with simdjson's SIMD instructions,
+write for jq work with sjq, and on large inputs they run ten to forty times
+faster on one thread, and up to 240 times faster with `-P` (several threads)
+on large newline-delimited files. sjq parses JSON with simdjson's SIMD instructions,
 reads only the parts of a document a filter needs when it can, maps files in
-memory instead of copying them, and filters large newline-delimited files on
-all cores.
+memory instead of copying them, and with `-P` filters large newline-delimited
+files on several cores.
 
 ## Install {#install}
 
@@ -139,7 +140,8 @@ sjq --arg user alice --argjson limit 10 '.[] | select(.owner == $user) | .size <
 | `--seq` | write an RS character before each output; read RS-separated input |
 | `--unbuffered` | flush the output after each input |
 | `-b`, `--binary` | on Windows, write LF line ends |
-| `--threads n` | worker threads for large files (1: sequential) |
+| `-P`, `--parallel` | filter large newline-delimited files on several threads: the available CPUs, up to 32 |
+| `--threads n` | the number of worker threads (0: every available CPU); the default is `SJQ_THREADS` if set, otherwise 1 |
 | `--no-od`, `--no-mmap` | turn off the On-Demand fast path (check all the input), or memory mapping |
 | `-V`, `--version`, `-h`, `--help` | |
 
@@ -209,10 +211,10 @@ two inputs built from simdjson's `twitter.json` sample: 1 GB of NDJSON (one
 tweet per line) and one 840 MB document. Each bar is the mean wall time of
 hyperfine runs (3 for jq, 10 for sjq), with the output written to
 `/dev/null`; the outputs of jq and sjq were checked to be identical. "sjq" is
-the default (all cores on large newline-delimited files);
-"sjq --threads 1" is sequential. The machine has two sockets, and the time of
+the default (one thread); "sjq -P" filters large newline-delimited files on
+up to 32 threads. The machine has two sockets, and the time of
 a run on one core depends on the socket it lands on (up to 25%): every run on
-one thread (jq, "sjq --threads 1", and sjq on the single document) is pinned
+one thread (jq, "sjq", and "sjq -P" on the single document) is pinned
 to the same socket.
 
 <picture>
@@ -228,9 +230,9 @@ to the same socket.
 {% include results.md %}
 
 These workloads show where sjq is strongest: large inputs, whose parsing
-dominates. Even sequential, sjq is twelve to forty times faster than jq here;
-on large newline-delimited files, its worker threads add another factor of
-five to nine. Filters with regular expressions run on one thread. A single
+dominates. On one thread, sjq is twelve to forty times faster than jq here;
+on large newline-delimited files, `-P` adds another factor of five to
+thirteen. Filters with regular expressions run on one thread. A single
 large document is parsed by one thread. Filters that compute a lot on small
 inputs gain less. To reproduce the
 numbers, see [`bench/`](https://github.com/simdjson/sjq/tree/main/bench).
@@ -313,7 +315,10 @@ unchanged.
   copying the input either.
 - **Parallelism.** Large newline-delimited files are cut into chunks that
   worker threads filter; the main thread writes the results in order, so the
-  output is the same as with one thread.
+  output is the same as with one thread. sjq runs on one thread unless asked:
+  `-P` takes the available CPUs (as limited by CPU affinity or a container
+  quota) up to 32, since more threads gain nothing when one thread writes all
+  the output; `--threads n` or `SJQ_THREADS` sets the count.
 - **Robustness.** A file that shrinks while it is mapped does not crash sjq;
   deep values and recursion end with an error, not a crash. sjq is fuzzed
   continuously in CI and tested against jq's own test suite and against jq.

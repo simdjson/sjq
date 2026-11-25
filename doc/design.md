@@ -64,7 +64,11 @@
   document that failed (an invalid document, a runtime error, or the
   incomplete document at a bad cut). That path also produces the error
   messages. `SJQ_DEBUG=1` prints the threads, the chunks and where the
-  sequential path resumes. `--threads 1` disables it, and RS-separated
+  sequential path resumes. sjq is sequential by default. `-P` takes the CPUs
+  the process may use (affinity mask and cgroup v2 `cpu.max` on Linux), at
+  most 32: speedup levels off past about 32 threads, and at 128 the run is
+  slower than at 32 with three times the CPU time. `--threads n` (0: every
+  available CPU) overrides `-P`, which overrides `SJQ_THREADS`. One thread disables it, and RS-separated
   (`--seq`) input is always read sequentially.
 
 - On-Demand fast path (default when the filter allows it): paths, `.[]`,
