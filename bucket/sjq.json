@@ -1,16 +1,16 @@
 {
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "A jq-compatible command-line JSON processor built on simdjson",
     "homepage": "https://simdjson.github.io/sjq/",
     "license": "Apache-2.0|MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/simdjson/sjq/releases/download/v0.3.0/sjq-windows-x86_64.zip",
-            "hash": "aae9a266a969de7249938f8484ded14e2d246934824db5ec5e9c9e7495d6acd8"
+            "url": "https://github.com/simdjson/sjq/releases/download/v0.4.0/sjq-windows-x86_64.zip",
+            "hash": "dd0e0a77aedb17f2978880be6fdb8bc98d911a59c3e9eb52cfd18f234627c346"
         },
         "arm64": {
-            "url": "https://github.com/simdjson/sjq/releases/download/v0.3.0/sjq-windows-arm64.zip",
-            "hash": "cc4d3b19368f404cab423616ea7cfe036eba737ff6ebd6f0b2d5333f370e622e"
+            "url": "https://github.com/simdjson/sjq/releases/download/v0.4.0/sjq-windows-arm64.zip",
+            "hash": "4fd18079357252d9e7ebe45fdd2403e9014047823e57ac903bd617e0645e585a"
         }
     },
     "bin": "sjq.exe",
