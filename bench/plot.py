@@ -15,8 +15,8 @@ from html import escape
 
 # Series, in legend order: name, result suffix, light color, dark color.
 SERIES = [
-    ("sjq", "sjq", "#2a78d6", "#3987e5"),
-    ("sjq --threads 1", "sjq1", "#eb6834", "#d95926"),
+    ("sjq -P", "sjq", "#2a78d6", "#3987e5"),
+    ("sjq", "sjq1", "#eb6834", "#d95926"),
     ("jq 1.8.2", "jq", "#1baf7a", "#199e70"),
 ]
 THEMES = {
@@ -123,12 +123,12 @@ def chart(rows, title, theme, colors):
 
 
 def table(rows, machine):
-    lines = ["| Input | Workload | Options and filter | jq 1.8.2 | sjq --threads 1 | sjq | Speedup |",
+    lines = ["| Input | Workload | Options and filter | jq 1.8.2 | sjq | sjq -P | Speedup |",
              "|---|---|---|---:|---:|---:|---:|"]
     for r in rows:
         # The options and the filter, without the program, the file and the
         # redirection.
-        words = shlex.split(r["times"]["sjq"][2].rsplit(" > ", 1)[0])
+        words = shlex.split(r["times"]["sjq1"][2].rsplit(" > ", 1)[0])
         # Skip a prefix such as taskset, then the program; drop the file.
         start = next(k for k, w in enumerate(words) if w.endswith("sjq")) + 1
         words = words[start:-1]

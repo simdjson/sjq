@@ -1,10 +1,10 @@
 #!/bin/bash
-# Times jq and sjq (default threads and --threads 1) with hyperfine.
+# Times jq and sjq (-P, and the default: one thread) with hyperfine.
 # Usage: run_bench.sh DATA_DIR RESULTS_DIR JQ SJQ HYPERFINE
 #
 # Environment:
 #   PIN_DOCUMENT  a command prefix for the runs on one thread (jq, sjq
-#                 --threads 1, and sjq on the single document), for example
+#                 without -P, and sjq -P on the single document), for example
 #                 "taskset -c 1-127:2": on a machine with several sockets, the
 #                 time of a one-thread run depends on the socket it lands on
 #                 (up to 25%), so they all run on the same one.
@@ -29,8 +29,8 @@ bench() {
   if [ "${SKIP_JQ:-}" != 1 ]; then
     "$HF" --shell=default --style basic --warmup 1 --runs 3 --export-json "$OUT/$id-jq.json" -n "jq" "$pin $JQ $args $DATA/$file > /dev/null"
   fi
-  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq.json" -n "sjq" "$pin_sjq $SJQ $args $DATA/$file > /dev/null"
-  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq1.json" -n "sjq --threads 1" "$pin $SJQ --threads 1 $args $DATA/$file > /dev/null"
+  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq.json" -n "sjq -P" "$pin_sjq $SJQ -P $args $DATA/$file > /dev/null"
+  "$HF" --shell=default --style basic --warmup 1 --runs 10 --export-json "$OUT/$id-sjq1.json" -n "sjq" "$pin $SJQ $args $DATA/$file > /dev/null"
 }
 rm -f "$OUT/index.tsv.new"
 bench "minify (-c .)" tweets.ndjson -c .
